@@ -1,0 +1,2649 @@
+(function () {
+  // ================= Re-run Safe Header =================
+  const ROOT_ID = "ivac-helper-box";
+
+  // আগের instance থাকলে teardown কল
+  if (window.__ivac_v2_helper_teardown) {
+    try { window.__ivac_v2_helper_teardown("rerun"); } catch (_) {}
+  }
+
+  // একই ID’র সব root div মুছে ফেলো
+  try { let n; while ((n = document.getElementById(ROOT_ID))) n.remove(); } catch (_) {}
+
+  // আগের ফ্ল্যাগ সরাও
+  try { delete window.__ivac_v2_helper__; } catch(_) {}
+
+  // =============== Const ===============
+  const API_BASE = "https://payment.ivacbd.com";
+  const API = API_BASE + "/api/v2";
+  const PROCESS_URL = API_BASE + "/api/payment/appointment/process";
+  const REF_ROOT = API_BASE + "/";
+  const REF_APPLICATION = API_BASE + "/application";
+  const RETRYABLE = new Set([500, 502, 504]);
+
+  const CAPMONSTER_CREATE_URL = "https://api.capmonster.cloud/createTask";
+  const CAPMONSTER_RESULT_URL = "https://api.capmonster.cloud/getTaskResult";
+  const CAPMONSTER_DEFAULT_KEY = "4ebc04a9cbe0d099b680fe3afae551fb";
+  let capMonsterClientKey = CAPMONSTER_DEFAULT_KEY;
+  try {
+    capMonsterClientKey = localStorage.getItem("capmonster_client_key") || capMonsterClientKey;
+  } catch(_) {}
+
+  // Turnstile sitekeys (can be overridden by LS keys below)
+  let SITEKEY_SHARED      = "0x4AAAAAABpNUpzYeppBoYpe"; // Login / Application / OTP
+  let SITEKEY_PAYNOW      = "0x4AAAAAABvQ3Mi6RktCuZ7P"; // Pay Now ONLY (default from saved context)
+  let SITEKEY_APPLICATION = "0x4AAAAAABvQ3Mi6RktCuZ7P"; // Application ONLY (if server differentiates)
+
+  // Optional overrides via LocalStorage (advanced users)
+  try {
+    SITEKEY_SHARED      = localStorage.getItem("ivac_sitekey_shared")      || SITEKEY_SHARED;
+    SITEKEY_PAYNOW      = localStorage.getItem("ivac_sitekey_paynow")      || SITEKEY_PAYNOW;
+    SITEKEY_APPLICATION = localStorage.getItem("ivac_sitekey_application") || SITEKEY_APPLICATION;
+  } catch(_) {}
+
+  // =============== State ===============
+  let authToken = null;
+  let hardStop = false;
+  let stopSeq = 0;
+  let activeRequests = [], loggedRequests = [];
+  let loginCountdownTimer = null, otpCountdownTimer = null, autoNextTimer = null;
+  let slotInfoHideTimer = null, otpInfoHideTimer = null, otpBannerHideTimer = null;
+  let passLoginCompleted = false;
+  let scheduleTimer = null, schedulePreloadTimer = null, scheduleTargetTs = null;
+  let scheduleInfoEl = null;
+  let appCloudUiReady = false;
+  let shouldAutoLoadAppCloudifier = false;
+  let autoAppCloudInFlight = false;
+  let payCloudUiReady = false;
+  let shouldAutoLoadPayCloudifier = false;
+  let autoPayCloudInFlight = false;
+  let sharedCloudWidgetId = null;
+  let appCloudWidgetId = null;
+  let payCloudWidgetId = null;
+  let appCloudSectionControl = null;
+  let payCloudSectionControl = null;
+  let sharedCapMonsterInFlight = false;
+  let appCapMonsterInFlight = false;
+  let payCapMonsterInFlight = false;
+  let autoSolveAllInFlight = false;
+  let autoSolveEnabled = false;
+  let autoSolvePrefFromStorage = false;
+  let autoAppClickDelaySec = 45;
+  let autoAppClickTargetTs = null;
+  let autoAppClickCountdownTimer = null;
+  let autoOpenApplicationAfterLogin = true;
+  let autoRetryPay422Enabled = false;
+  let autoRetryPay422Active = false;
+  let payRetryDelaySec = 5;
+  let payAutoRetryPending = false;
+  let payAutoRetryTimer = null;
+  let manualTokShared = null, autoTokShared = null;
+  let manualTokApp = null, autoTokApp = null;
+  let manualTokPay = null, autoTokPay = null;
+  let btnApplication = null;
+  let autoOpenApplicationCB = null;
+  let autoAppCountdownEl = null;
+  let postLoginAppClickTimer = null;
+  let pendingAutoApplicationClick = false;
+  let lastTokenScheduledForAutoClick = null;
+  let scheduleCountdownEl = null;
+  let scheduleCountdownTimer = null;
+  let scheduleCountdownTargetTs = null;
+  let autoRetryPay422CB = null;
+  let payRetryDelaySelect = null;
+  let payRetryCountdownEl = null;
+  let payRetryCountdownTimer = null;
+  let payRetryNextAttemptTs = null;
+  try {
+    const storedAutoSolvePref = localStorage.getItem("auto_solve_captchas");
+    if(storedAutoSolvePref === null){
+      try{ localStorage.setItem("auto_solve_captchas", "0"); }catch(_){ }
+    }
+    autoSolvePrefFromStorage = storedAutoSolvePref === "1";
+    const storedDelay = parseInt(localStorage.getItem("auto_app_click_delay_sec") || "", 10);
+    if(!Number.isNaN(storedDelay) && storedDelay >= 0 && storedDelay <= 3600){
+      autoAppClickDelaySec = storedDelay;
+    }
+    const storedOpenPref = localStorage.getItem("auto_open_application_tab");
+    const storedOpenPrefVersion = localStorage.getItem("auto_open_application_tab_version");
+    if(storedOpenPrefVersion !== "2"){
+      autoOpenApplicationAfterLogin = true;
+      try{
+        localStorage.setItem("auto_open_application_tab", "1");
+        localStorage.setItem("auto_open_application_tab_version", "2");
+      }catch(_){ }
+    } else {
+      autoOpenApplicationAfterLogin = storedOpenPref === "0" ? false : true;
+    }
+    const storedPayRetry = localStorage.getItem("auto_retry_pay422");
+    if(storedPayRetry === "1"){ autoRetryPay422Enabled = true; }
+    else if(storedPayRetry === "0"){ autoRetryPay422Enabled = false; }
+    const storedPayRetryDelayStr = localStorage.getItem("auto_retry_pay422_delay_sec");
+    const storedPayRetryDelay = parseInt(storedPayRetryDelayStr || "", 10);
+    if(!Number.isNaN(storedPayRetryDelay) && [5,10,15].includes(storedPayRetryDelay)){
+      payRetryDelaySec = storedPayRetryDelay;
+    }
+    if(storedPayRetryDelayStr === null){
+      localStorage.setItem("auto_retry_pay422_delay_sec", String(payRetryDelaySec));
+    }
+  } catch(_) {}
+
+  // Cloudifier tokens
+  let cloudifierTokenShared = null; // shared (SITEKEY_SHARED)
+  let cloudifierTokenPay = null;    // pay-now (SITEKEY_PAYNOW)
+  let cloudifierTokenApp = null;    // application (SITEKEY_APPLICATION)
+
+  // countdown end timestamps
+  let loginSessionEndTs = null; // +1h from login success
+  let otpEndTs = null;          // +10m from OTP sent
+
+  // =============== Utils/UI ===============
+  function clearScheduleTimers(){
+    if(scheduleTimer){ try{clearTimeout(scheduleTimer);}catch(_){ } scheduleTimer=null; }
+    if(schedulePreloadTimer){ try{clearTimeout(schedulePreloadTimer);}catch(_){ } schedulePreloadTimer=null; }
+    scheduleTargetTs=null;
+    stopScheduleCountdown();
+  }
+
+  function requestAutoApplicationCloudifier(){
+    if(cloudifierTokenApp || (manualTokApp && manualTokApp.value && manualTokApp.value.trim())){
+      shouldAutoLoadAppCloudifier = false;
+      return;
+    }
+    shouldAutoLoadAppCloudifier = true;
+    if(!autoSolveEnabled) return;
+    if(appCloudSectionControl && typeof appCloudSectionControl.open === "function"){ appCloudSectionControl.open(); }
+    if(appCloudUiReady){ autoLoadApplicationCloudifierIfNeeded(); }
+  }
+
+  function requestAutoPayCloudifier(){
+    if(cloudifierTokenPay || (manualTokPay && manualTokPay.value && manualTokPay.value.trim())){
+      shouldAutoLoadPayCloudifier = false;
+      return;
+    }
+    shouldAutoLoadPayCloudifier = true;
+    if(!autoSolveEnabled) return;
+    if(payCloudSectionControl && typeof payCloudSectionControl.open === "function"){ payCloudSectionControl.open(); }
+    if(payCloudUiReady){ autoLoadPayCloudifierIfNeeded(); }
+  }
+
+  function scheduleAutoApplicationClick(delayMs){
+    if(postLoginAppClickTimer){ try{ clearTimeout(postLoginAppClickTimer); }catch(_){ } postLoginAppClickTimer = null; }
+    let effectiveDelay = Number.isFinite(delayMs) ? delayMs : (autoAppClickDelaySec * 1000);
+    if(effectiveDelay < 0) effectiveDelay = 0;
+    pendingAutoApplicationClick = true;
+    autoAppClickTargetTs = Date.now() + effectiveDelay;
+    startAutoAppCountdown();
+    postLoginAppClickTimer = setTimeout(()=>{
+      postLoginAppClickTimer = null;
+      pendingAutoApplicationClick = false;
+      autoAppClickTargetTs = null;
+      stopAutoAppCountdown();
+      if(!autoCB || !autoCB.checked){ return; }
+      if(!btnApplication){
+        scheduleAutoApplicationClick(1000);
+        return;
+      }
+      try{ btnApplication.click(); }catch(_){ }
+    }, effectiveDelay);
+    return effectiveDelay;
+  }
+
+  function cancelAutoApplicationClick(){
+    if(postLoginAppClickTimer){ try{ clearTimeout(postLoginAppClickTimer); }catch(_){ } postLoginAppClickTimer = null; }
+    pendingAutoApplicationClick = false;
+    stopAutoAppCountdown();
+  }
+
+  function applyAutoAppClickDelay(newSeconds, {rescheduleExisting=true, persist=true} = {}){
+    let sec = parseInt(newSeconds, 10);
+    if(Number.isNaN(sec)) sec = autoAppClickDelaySec;
+    if(!Number.isFinite(sec)) sec = autoAppClickDelaySec || 45;
+    sec = Math.max(0, Math.min(sec, 3600));
+    autoAppClickDelaySec = sec;
+    if(persist){
+      try{ localStorage.setItem("auto_app_click_delay_sec", String(autoAppClickDelaySec)); }catch(_){ }
+    }
+    if(rescheduleExisting && (postLoginAppClickTimer || pendingAutoApplicationClick)){
+      scheduleAutoApplicationClick(autoAppClickDelaySec * 1000);
+    }
+    return autoAppClickDelaySec;
+  }
+
+  function handleAuthTokenAvailable(){
+    if(!authToken) return;
+    requestAutoApplicationCloudifier();
+    const hasApplicationToken = !!cloudifierTokenApp || (manualTokApp && manualTokApp.value && manualTokApp.value.trim());
+    if(authToken !== lastTokenScheduledForAutoClick){
+      lastTokenScheduledForAutoClick = authToken;
+      if(!hasApplicationToken){ scheduleAutoApplicationClick(); }
+    } else if(!hasApplicationToken && !postLoginAppClickTimer && !pendingAutoApplicationClick){
+      scheduleAutoApplicationClick();
+    }
+  }
+  function btn(txt,bg="#0d6efd"){
+    const b=document.createElement("button"); b.textContent=txt;
+    Object.assign(b.style,{padding:"10px 12px",border:"none",borderRadius:"8px",color:"#fff",background:bg,fontWeight:"600",cursor:"pointer",flex:"1 1 0"});
+    return b;
+  }
+  function input(ph,type="text"){
+    const i=document.createElement("input"); i.placeholder=ph; i.type=type;
+    Object.assign(i.style,{padding:"10px",border:"1px solid #2a2f36",borderRadius:"8px",background:"#0d1116",color:"#eaeef2",flex:"1 1 0",minWidth:"100px"});
+    return i;
+  }
+  function textarea(ph){
+    const t=document.createElement("textarea"); t.placeholder=ph;
+    Object.assign(t.style,{padding:"10px",border:"1px solid #2a2f36",borderRadius:"8px",background:"#0d1116",color:"#eaeef2",width:"100%",minHeight:"120px"});
+    return t;
+  }
+  function select(opts){
+    const s=document.createElement("select");
+    Object.assign(s.style,{padding:"10px",border:"1px solid #2a2f36",borderRadius:"8px",background:"#0d1116",color:"#eaeef2",flex:"1 1 0"});
+    opts.forEach(([l,v])=>{const o=document.createElement("option");o.value=v;o.textContent=l;s.appendChild(o);});
+    return s;
+  }
+  function row(...els){
+    const d=document.createElement("div");
+    Object.assign(d.style,{display:"flex",gap:"6px",marginBottom:"8px",alignItems:"center",flexWrap:"wrap"});
+    els.forEach(e=>{ if(e && e.style && !e.style.flex) e.style.flex="1 1 0"; d.appendChild(e); });
+    return d;
+  }
+  function label(txt){ const d=document.createElement("div"); d.textContent=txt; Object.assign(d.style,{fontSize:"12px",opacity:.8,margin:"6px 0"}); return d; }
+  function section(titleText){
+    const wrap=document.createElement("div"), head=document.createElement("div"), chev=document.createElement("span"), ttl=document.createElement("span");
+    chev.textContent="▶"; chev.style.marginRight="8px"; ttl.textContent=titleText; ttl.style.fontWeight = "700";
+    Object.assign(head.style,{cursor:"pointer",userSelect:"none",margin:"8px 0"});
+    const body=document.createElement("div"); body.style.display="none";
+    const setOpen=(open)=>{
+      body.style.display = open ? "block" : "none";
+      chev.textContent = open ? "▼" : "▶";
+    };
+    head.onclick=()=>{ setOpen(body.style.display !== "block"); };
+    head.append(chev,ttl);
+    wrap.append(head,body);
+    return {wrap,body,open:()=>setOpen(true),close:()=>setOpen(false),isOpen:()=>body.style.display==="block"};
+  }
+  function beep(){ try{ const c=new (window.AudioContext||window.webkitAudioContext)(); const o=c.createOscillator(); o.type="sine"; o.frequency.value=800; o.connect(c.destination); o.start(); o.stop(c.currentTime+0.15);}catch(_){} }
+  const delaySec = (s)=>new Promise(r=>setTimeout(r,Math.max(0,(s||0))*1000));
+
+  function formatCountdown(ms, {includeHours=false}={}){
+    if(!Number.isFinite(ms)) return "00:00";
+    const totalSeconds = Math.max(0, Math.floor(ms/1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const parts = [];
+    if(includeHours || hours > 0){
+      parts.push(String(hours).padStart(2,"0"));
+      parts.push(String(minutes).padStart(2,"0"));
+    } else {
+      parts.push(String(minutes).padStart(2,"0"));
+    }
+    parts.push(String(seconds).padStart(2,"0"));
+    return parts.join(":");
+  }
+
+  function updateAutoAppCountdownDisplay(){
+    if(!autoAppCountdownEl){ return; }
+    if(!autoAppClickTargetTs){
+      autoAppCountdownEl.textContent = "";
+      autoAppCountdownEl.style.display = "none";
+      return;
+    }
+    if(autoCB && !autoCB.checked){
+      autoAppCountdownEl.textContent = "";
+      autoAppCountdownEl.style.display = "none";
+      return;
+    }
+    const remaining = autoAppClickTargetTs - Date.now();
+    const label = remaining <= 0 ? "– 00:00" : `– ${formatCountdown(remaining, {includeHours:false})}`;
+    autoAppCountdownEl.textContent = label;
+    autoAppCountdownEl.style.display = "";
+  }
+
+  function startAutoAppCountdown(){
+    if(autoAppClickCountdownTimer){ try{ clearInterval(autoAppClickCountdownTimer); }catch(_){ } autoAppClickCountdownTimer = null; }
+    updateAutoAppCountdownDisplay();
+    if(!autoAppClickTargetTs){ return; }
+    autoAppClickCountdownTimer = setInterval(()=>{
+      if(!autoAppClickTargetTs){
+        stopAutoAppCountdown();
+        return;
+      }
+      updateAutoAppCountdownDisplay();
+    }, 500);
+  }
+
+  function stopAutoAppCountdown(clearTarget=true){
+    if(autoAppClickCountdownTimer){ try{ clearInterval(autoAppClickCountdownTimer); }catch(_){ } autoAppClickCountdownTimer = null; }
+    if(clearTarget){ autoAppClickTargetTs = null; }
+    if(!autoAppCountdownEl){ return; }
+    if(clearTarget){
+      autoAppCountdownEl.textContent = "";
+      autoAppCountdownEl.style.display = "none";
+    } else {
+      autoAppCountdownEl.textContent = "– 00:00";
+      autoAppCountdownEl.style.display = "";
+    }
+  }
+
+  function updateScheduleCountdownDisplay(){
+    if(!scheduleCountdownEl){ return; }
+    if(!scheduleCountdownTargetTs){
+      scheduleCountdownEl.textContent = "";
+      scheduleCountdownEl.style.display = "none";
+      return;
+    }
+    const remaining = scheduleCountdownTargetTs - Date.now();
+    const label = remaining <= 0 ? "– 00:00" : `– ${formatCountdown(remaining, {includeHours:true})}`;
+    scheduleCountdownEl.textContent = label;
+    scheduleCountdownEl.style.display = "";
+  }
+
+  function startScheduleCountdown(ts){
+    scheduleCountdownTargetTs = ts;
+    if(scheduleCountdownTimer){ try{ clearInterval(scheduleCountdownTimer); }catch(_){ } scheduleCountdownTimer = null; }
+    updateScheduleCountdownDisplay();
+    if(!scheduleCountdownTargetTs){ return; }
+    scheduleCountdownTimer = setInterval(()=>{
+      if(!scheduleCountdownTargetTs){
+        stopScheduleCountdown();
+        return;
+      }
+      updateScheduleCountdownDisplay();
+    }, 500);
+  }
+
+  function stopScheduleCountdown(clearTarget=true){
+    if(scheduleCountdownTimer){ try{ clearInterval(scheduleCountdownTimer); }catch(_){ } scheduleCountdownTimer = null; }
+    if(clearTarget){ scheduleCountdownTargetTs = null; }
+    if(!scheduleCountdownEl){ return; }
+    if(clearTarget){
+      scheduleCountdownEl.textContent = "";
+      scheduleCountdownEl.style.display = "none";
+    } else {
+      scheduleCountdownEl.textContent = "– 00:00";
+      scheduleCountdownEl.style.display = "";
+    }
+  }
+
+  function updatePayRetryCountdownDisplay(){
+    if(!payRetryCountdownEl){ return; }
+    if(!autoRetryPay422Enabled || !autoRetryPay422Active || !payRetryNextAttemptTs){
+      payRetryCountdownEl.textContent = "";
+      payRetryCountdownEl.style.display = "none";
+      return;
+    }
+    const remaining = payRetryNextAttemptTs - Date.now();
+    const label = remaining <= 0 ? "– 00:00" : `– ${formatCountdown(remaining)}`;
+    payRetryCountdownEl.textContent = label;
+    payRetryCountdownEl.style.display = "";
+  }
+
+  function startPayRetryCountdown(){
+    if(payRetryCountdownTimer){ try{ clearInterval(payRetryCountdownTimer); }catch(_){ } payRetryCountdownTimer = null; }
+    updatePayRetryCountdownDisplay();
+    if(!autoRetryPay422Enabled || !autoRetryPay422Active || !payRetryNextAttemptTs){ return; }
+    payRetryCountdownTimer = setInterval(()=>{
+      if(!autoRetryPay422Enabled || !autoRetryPay422Active || !payRetryNextAttemptTs){
+        stopPayRetryCountdown();
+        return;
+      }
+      updatePayRetryCountdownDisplay();
+    }, 500);
+  }
+
+  function stopPayRetryCountdown(clearTarget=true){
+    if(payRetryCountdownTimer){ try{ clearInterval(payRetryCountdownTimer); }catch(_){ } payRetryCountdownTimer = null; }
+    if(clearTarget){ payRetryNextAttemptTs = null; }
+    if(!payRetryCountdownEl){ return; }
+    payRetryCountdownEl.textContent = "";
+    payRetryCountdownEl.style.display = "none";
+  }
+
+  function autoSolveTurnstile(widgetId, infoEl, tokenAccessor){
+    if(!widgetId || !window.turnstile || typeof window.turnstile.execute !== "function") return;
+    let attempts = 0;
+    const stillMissingToken = ()=>{
+      if(typeof tokenAccessor !== "function") return true;
+      try{ return !tokenAccessor(); }
+      catch(_){ return true; }
+    };
+    const tryExec = ()=>{
+      if(!stillMissingToken()) return;
+      if(!widgetId || !window.turnstile || typeof window.turnstile.execute !== "function") return;
+      attempts++;
+      try{
+        const maybePromise = window.turnstile.execute(widgetId);
+        if(maybePromise && typeof maybePromise.then === "function"){
+          maybePromise.then(()=>{
+            if(stillMissingToken() && attempts < 5){ setTimeout(tryExec, 600); }
+          }).catch(()=>{
+            if(attempts < 5){ setTimeout(tryExec, 600); }
+            else if(infoEl){ infoEl.textContent = "⚠️ Auto solve unavailable. Solve manually."; }
+          });
+        } else if(stillMissingToken() && attempts < 5){
+          setTimeout(tryExec, 600);
+        }
+      }catch(err){
+        if(attempts < 5){
+          setTimeout(tryExec, 600);
+        } else if(infoEl){
+          try{ infoEl.textContent = "⚠️ Auto solve unavailable. Solve manually."; }
+          catch(_){ }
+        }
+      }
+    };
+    setTimeout(tryExec, 80);
+  }
+
+  const hasCapMonsterKey = ()=>!!(capMonsterClientKey && String(capMonsterClientKey).trim());
+
+  async function capMonsterCreateTask(siteKey, pageUrl){
+    if(!hasCapMonsterKey()) throw new Error("CapMonster key missing");
+    let res;
+    try{
+      res = await fetch(CAPMONSTER_CREATE_URL, {
+        method: "POST",
+        mode: "cors",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clientKey: capMonsterClientKey,
+          task: {
+            type: "TurnstileTaskProxyless",
+            websiteURL: pageUrl,
+            websiteKey: siteKey
+          }
+        })
+      });
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err || "network error");
+      throw new Error(`CapMonster createTask network error: ${msg}`);
+    }
+    let text = "";
+    try{ text = await res.text(); }catch(_){ text = ""; }
+    if(!res.ok){
+      const snippet = text ? text.replace(/\s+/g," ").trim().slice(0,180) : res.statusText;
+      throw new Error(`CapMonster createTask HTTP ${res.status}${snippet ? ": " + snippet : ""}`);
+    }
+    let json = null;
+    if(text){
+      try{ json = JSON.parse(text); }
+      catch(_){ throw new Error("CapMonster createTask parse error"); }
+    }
+    if(!json) throw new Error("CapMonster createTask parse error (empty)");
+    if(json.errorId && json.errorId !== 0) throw new Error(json.errorDescription || "CapMonster createTask error");
+    if(!json.taskId) throw new Error("CapMonster taskId missing");
+    return json.taskId;
+  }
+
+  async function capMonsterFetchResult(taskId){
+    if(!hasCapMonsterKey()) throw new Error("CapMonster key missing");
+    let res;
+    try{
+      res = await fetch(CAPMONSTER_RESULT_URL, {
+        method: "POST",
+        mode: "cors",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientKey: capMonsterClientKey, taskId })
+      });
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err || "network error");
+      throw new Error(`CapMonster getTaskResult network error: ${msg}`);
+    }
+    let text = "";
+    try{ text = await res.text(); }catch(_){ text = ""; }
+    if(!res.ok){
+      const snippet = text ? text.replace(/\s+/g," ").trim().slice(0,180) : res.statusText;
+      throw new Error(`CapMonster getTaskResult HTTP ${res.status}${snippet ? ": " + snippet : ""}`);
+    }
+    let json = null;
+    if(text){
+      try{ json = JSON.parse(text); }
+      catch(_){ throw new Error("CapMonster getTaskResult parse error"); }
+    }
+    if(!json) throw new Error("CapMonster getTaskResult parse error (empty)");
+    if(json.errorId && json.errorId !== 0) throw new Error(json.errorDescription || "CapMonster getTaskResult error");
+    return json;
+  }
+
+  async function capMonsterSolve(siteKey, pageUrl, infoEl){
+    if(!hasCapMonsterKey()){
+      if(infoEl) try{ infoEl.textContent = "❗ Set CapMonster API key."; }catch(_){ }
+      throw new Error("CapMonster key missing");
+    }
+    if(infoEl) try{ infoEl.textContent = "🤖 CapMonster solving…"; }catch(_){ }
+    const taskId = await capMonsterCreateTask(siteKey, pageUrl);
+    for(let attempt = 0; attempt < 40; attempt++){
+      await delaySec(attempt === 0 ? 2 : 2);
+      const result = await capMonsterFetchResult(taskId);
+      if(result.status === "processing"){
+        if(infoEl) try{ infoEl.textContent = `🤖 CapMonster solving… (#${attempt+1})`; }catch(_){ }
+        continue;
+      }
+      if(result.status === "ready"){
+        const token = result.solution && (result.solution.token || result.solution.cfTurnstileResponse);
+        if(!token) throw new Error("CapMonster returned empty token");
+        if(infoEl) try{ infoEl.textContent = "✅ CapMonster token ready."; }catch(_){ }
+        return token;
+      }
+      throw new Error("CapMonster unexpected status");
+    }
+    throw new Error("CapMonster timeout");
+  }
+
+  // =============== Shell (with ID for teardown) ===============
+  const box=document.createElement("div");
+  box.id = ROOT_ID;
+  Object.assign(box.style,{
+    position:"fixed", top:"64px", left:"64px", zIndex:999999,
+    width:"520px", maxHeight:"90vh", overflow:"auto",
+    background:"#101317", color:"#eaeef2",
+    border:"1px solid #2a2f36", borderRadius:"14px",
+    boxShadow:"0 8px 32px rgba(0,0,0,.35)", fontFamily:"Inter,ui-sans-serif", padding:"14px"
+  });
+  document.body.appendChild(box);
+  // Global error surface
+  window.addEventListener("error", function(e){
+    try{
+      const msg = (e && e.message) ? e.message : String(e);
+      if (typeof setStatus === "function") setStatus("⚠️ JS Error: " + msg);
+    }catch(_){}
+  }, true);
+  window.addEventListener("unhandledrejection", function(e){
+    try{
+      const msg = (e && e.reason && (e.reason.message || e.reason)) ? (e.reason.message || String(e.reason)) : "Promise rejection";
+      if (typeof setStatus === "function") setStatus("⚠️ Promise Error: " + msg);
+    }catch(_){}
+  }, true);
+
+
+  const title=document.createElement("div");
+  title.textContent="💳 IVAC Helper — Cloudifier, OTP, Pay";
+  Object.assign(title.style,{fontWeight:800,fontSize:"16px"});
+
+  const dragHandle=document.createElement("div");
+  dragHandle.textContent="⋮⋮";
+  Object.assign(dragHandle.style,{cursor:"grab", userSelect:"none", opacity:.6, padding:"2px 6px",border:"1px solid #2a2f36", borderRadius:"6px"});
+
+  const header=document.createElement("div");
+  Object.assign(header.style,{display:"flex",alignItems:"center",gap:"8px",marginBottom:"8px"});
+  header.append(dragHandle,title);
+  box.append(header);
+
+  let dragging=false,ox=0,oy=0;
+  dragHandle.addEventListener("mousedown", e=>{
+    dragging=true; dragHandle.style.cursor="grabbing";
+    ox = e.clientX - box.offsetLeft; oy = e.clientY - box.offsetTop; e.preventDefault();
+  });
+  document.addEventListener("mousemove", e=>{
+    if (!dragging) return; box.style.left = (e.clientX - ox) + "px"; box.style.top  = (e.clientY - oy) + "px";
+  });
+  document.addEventListener("mouseup", ()=>{ if (dragging){ dragging=false; dragHandle.style.cursor="grab"; } });
+
+  // =============== Toggles ===============
+  const retryCB=document.createElement("input"); retryCB.type="checkbox"; retryCB.checked=false;
+  const retryLbl=document.createElement("label"); retryLbl.textContent=" Retry"; retryLbl.style.marginRight="12px";
+  const retryDelaySecInp=input("Retry delay (sec)","number"); retryDelaySecInp.value="7"; retryDelaySecInp.style.width = "120px";
+  const autoCB=document.createElement("input"); autoCB.type="checkbox"; autoCB.checked=false;
+  const autoLbl=document.createElement("label"); autoLbl.textContent=" Auto"; autoLbl.style.marginLeft="10px"; autoLbl.style.marginRight="12px";
+  const autoDelaySec=input("Auto delay (sec)","number"); autoDelaySec.value="7"; autoDelaySec.style.width = "120px";
+  box.append(row(retryCB,retryLbl,retryDelaySecInp,autoCB,autoLbl,autoDelaySec));
+  autoCB.onchange = ()=>{
+    if(!autoCB.checked){ cancelAutoApplicationClick(); }
+    else { handleAuthTokenAvailable(); }
+  };
+
+  // =============== Status + Active ===============
+  const statusBox=document.createElement("div");
+  Object.assign(statusBox.style,{background:"#151a21",border:"1px solid #2a2f36",borderRadius:"10px",padding:"10px",minHeight:"48px",whiteSpace:"pre-wrap",fontSize:"13px"});
+  box.append(statusBox);
+  const setStatus=(m)=>{ statusBox.textContent=m; };
+
+  const reqList=document.createElement("ul");
+  Object.assign(reqList.style,{margin:"8px 0",padding:"8px",background:"#0d1116",border:"1px solid #2a2f36",borderRadius:"10px",maxHeight:"120px",overflow:"auto",fontSize:"13px"});
+  box.append(label("Active Requests"),reqList);
+  function refreshActive(){ reqList.innerHTML=""; activeRequests.forEach(r=>{ const li=document.createElement("li"); li.textContent=`${r.name} — ${r.status}`; reqList.appendChild(li); }); }
+  function addLog(name,status,payload,response){ loggedRequests.push({name,status,payload,response,ts:new Date().toISOString()}); }
+
+  // =============== Webfile ID sync (App -> Personal) ===============
+  function setWebfileLS(v){
+    try{
+      if(!v) return;
+      localStorage.setItem('webfile_id', v);
+      localStorage.setItem('webfile', v);
+      localStorage.setItem('wfile', v);
+    }catch(_){ }
+  }
+  function mirrorWebfileToSite(){
+    try{
+      var v = localStorage.getItem('webfile_id') || localStorage.getItem('webfile') || "";
+      if(!v) return false;
+      var els = Array.from(document.querySelectorAll('input[placeholder*="WEB FILE" i], input[placeholder*="WEB FILE NUMBER" i], input[name*="webfile" i], input[name="webfile_id"], input[name="webfile"], input[id*="webfile" i]'));
+      var wrote = false;
+      els.forEach(function(el){
+        if(el){
+          var was = !!el.disabled; el.disabled = false;
+          el.value = v; el.setAttribute("value", v);
+          el.dispatchEvent(new Event('input',{bubbles:true}));
+          el.dispatchEvent(new Event('change',{bubbles:true}));
+          wrote = true; el.dispatchEvent(new Event("input",{bubbles:true})); el.dispatchEvent(new Event("change",{bubbles:true})); if (was) el.disabled = true; }
+      });
+      return true;
+    }catch(_){ return false; }
+  }
+  (function initWebfileMirror(){
+    mirrorWebfileToSite();
+    new MutationObserver(()=>mirrorWebfileToSite()).observe(document.body,{subtree:true,childList:true});
+  })();
+
+  
+// ===== Overview FEES + Personal Info hydrators (from LocalStorage) =====
+function hydrateOverviewFeesAuto() {
+  // 1) initialData → amount
+  let amount = null;
+  try {
+    const init = JSON.parse(localStorage.getItem("initialData") || "{}");
+    amount = init?.payable_amount ?? init?.payment_fee ?? init?.fees ?? init?.fee ?? null;
+  } catch (_) {}
+
+  // 2) fallback: visa_type → fee map
+  if (amount == null) {
+    try {
+      const app = (typeof getApplicantLS === "function" ? getApplicantLS() : JSON.parse(localStorage.getItem("applicant") || "{}"));
+      const vt = String(app?.visa_type || "");
+      const feeMap = { "06": 1500, "6":1500, "13": 1500, "2":1500, "19":1500 };
+      amount = feeMap[vt] ?? 1500;
+    } catch (_) {
+      amount = 1500;
+    }
+  }
+
+  try { localStorage.setItem("payable_amount", String(amount)); } catch (_) {}
+  updateOverviewFeeInDOM(amount);
+}
+
+function updateOverviewFeeInDOM(amount) {
+  const valueText = `BDT ${amount}`;
+  const all = document.querySelectorAll("*");
+
+  // Try label "FEES" → next box
+  for (const n of all) {
+    if (n.childElementCount === 0 && /^FEES$/i.test((n.textContent||"").trim())) {
+      const valBox = n.nextElementSibling || n.parentElement?.querySelector(".value");
+      if (valBox) { valBox.textContent = valueText; return; }
+    }
+  }
+  // Fallback: replace any "BDT null"
+  for (const n of all) {
+    if (n.childElementCount === 0 && /BDT\s*null/i.test(n.textContent||"")) {
+      n.textContent = valueText;
+    }
+  }
+}
+
+// Personal info (name/email/phone/webfile) hydrate on Overview card
+function hydrateOverviewPersonalAuto(){
+  try{
+    const nm = (localStorage.getItem("user_name") || localStorage.getItem("auth_name") || "").trim();
+    const em = (localStorage.getItem("user_email") || localStorage.getItem("auth_email") || "").replace(/^"+|"+$/g,"").trim();
+    const ph = (localStorage.getItem("user_phone") || localStorage.getItem("auth_phone") || "").trim();
+    const wf = (localStorage.getItem("webfile_id") || localStorage.getItem("webfile") || "").trim();
+    const setNext = (labelRx, value) => {
+      if(!value) return false;
+      const nodes = document.querySelectorAll("*");
+      for (const n of nodes) {
+        if (n.childElementCount===0 && labelRx.test((n.textContent||"").trim())) {
+          const valBox = n.nextElementSibling || n.parentElement?.querySelector(".value");
+          if (valBox) { valBox.textContent = value; return true; }
+        }
+      }
+      return false;
+    };
+    setNext(/^NAME$/i, nm);
+    setNext(/^EMAIL$/i, em);
+    setNext(/^CONTACT\s*NUMBER$/i, ph);
+    setNext(/^WEB\s*FILE\s*(NUMBER)?$/i, wf);
+  }catch(_){ }
+}
+
+// ===== Step Persistence & Site-Step Navigator =====
+  function setActiveStepLS(n){
+    try {
+      localStorage.setItem('activeStep', String(n));
+      localStorage.setItem('IVAC_TARGET_STEP', String(n));
+    } catch(_){ }
+  }
+  function gotoSiteStep(n){
+    try{
+      const map = {1:/Application\s*Info/i, 2:/Personal\s*Info/i, 3:/Overview/i, 4:/Payment/i};
+      const rx = map[n] || null;
+      if(!rx) return false;
+      const nodes = Array.from(document.querySelectorAll('a,button,[role="tab"],.nav-link,.step,li,div,span'))
+        .filter(el => el && el.textContent && rx.test(el.textContent.trim()));
+      let el = nodes.find(x => x.tagName === 'A' || x.tagName === 'BUTTON' || typeof x.onclick === 'function') || nodes[0];
+      if (el){ el.click(); try{ if (n===3){ setTimeout(hydrateOverviewFeesAuto,250); setTimeout(hydrateOverviewPersonalAuto,300);} }catch(_){ }
+        return true; }
+    }catch(_){ }
+    return false;
+  }
+  function restoreStepOnLoad(){
+  const n = parseInt(localStorage.getItem('IVAC_TARGET_STEP') || localStorage.getItem('activeStep') || '1', 10);
+  if (n > 1) {
+    if (!gotoSiteStep(n)) {
+      new MutationObserver((m,obs) => {
+        if (gotoSiteStep(n)) {
+          try{ mirrorWebfileToSite(); }catch(_){ }
+          obs.disconnect();
+        }
+      }).observe(document.body, {subtree:true, childList:true});
+    } else {
+      try{ mirrorWebfileToSite(); }catch(_){ }
+    }
+  }
+}
+
+  // =============== Auth token capture ===============
+  (function(){
+    try{
+      const acc = localStorage.getItem("access_token");
+      if (acc) { authToken = "Bearer " + acc; handleAuthTokenAvailable(); }
+    }catch(_){ }
+    if (!authToken){
+      [localStorage,sessionStorage].forEach(s=>{
+        try{
+          for(let i=0;i<s.length;i++){
+            const k = s.key(i);
+            const v = s.getItem(k);
+            if(k==="access_token" && v){ authToken = "Bearer " + v; handleAuthTokenAvailable(); break; }
+            if(!authToken && v && /^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/.test(v)){
+              authToken = "Bearer " + v;
+              handleAuthTokenAvailable();
+            }
+          }
+        }catch(_){ }
+      });
+    }
+  })();
+
+  // fetch override (restore-safe) — also keeps token box synced when app code sets it
+  window.__ivac_v2_orig_fetch = window.__ivac_v2_orig_fetch || window.fetch;
+  const _fetch = window.__ivac_v2_orig_fetch;
+  window.fetch = async function(...a){
+    const[,cfg]=a;
+    if(cfg?.headers?.Authorization?.startsWith("Bearer")) { authToken = cfg.headers.Authorization; try{ tokenInp.value = authToken; }catch(_){ } handleAuthTokenAvailable(); }
+    return _fetch.apply(this,a);
+  };
+
+  // =============== Turnstile Loader (single) ===============
+  let turnstileLoading = null;
+  function ensureTurnstile(){
+    if (window.turnstile) return Promise.resolve();
+    if (turnstileLoading)  return turnstileLoading;
+    turnstileLoading = new Promise((res, rej)=>{
+      const s = document.createElement("script");
+      s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+      s.async = true; s.defer = true;
+      s.onload = ()=>res(); s.onerror = ()=>rej(new Error("Turnstile load failed"));
+      document.head.appendChild(s);
+    });
+    return turnstileLoading;
+  }
+
+  // ---------- CSRF helpers ----------
+  function readCookie(name){
+    try{
+      const m = document.cookie.match(new RegExp('(?:^|; )'+name.replace(/([.$?*|{}()\[\]\\\/\+^])/g,'\\$1')+'=([^;]*)'));
+      return m ? decodeURIComponent(m[1]) : "";
+    }catch(_){ return ""; }
+  }
+  function getCSRF(){
+    const c1 = readCookie('XSRF-TOKEN');
+    const c2 = readCookie('csrf_token');
+    const meta = document.querySelector('meta[name="csrf-token"], meta[name="X-CSRF-TOKEN"]');
+    return (c1 || c2 || (meta && meta.getAttribute('content')) || "").replace(/^"|"$/g,"");
+  }
+
+  // =============== Header helpers (HAR parity) ===============
+  function applyCommonHeaders(headers, {withAuth=true, withCSRF=true, extraHeaders=null}={}){
+    try {
+      const lang = localStorage.getItem('language') || 'en';
+      headers['Language'] = lang;
+      headers['language'] = lang;
+      if (!headers['Accept']) headers['Accept'] = 'application/json, text/plain, */*';
+      headers['X-Requested-With'] = 'XMLHttpRequest';
+      if (withAuth && authToken) headers.Authorization = authToken;
+      if (withCSRF){
+        const t = getCSRF();
+        if (t) {
+          headers['X-XSRF-TOKEN'] = t;
+          headers['X-CSRF-TOKEN'] = t;
+        }
+      }
+      if (extraHeaders && typeof extraHeaders === 'object') {
+        Object.assign(headers, extraHeaders);
+      }
+    } catch(_) {}
+    return headers;
+  }
+  function commonFetchOptions(extra){
+    return Object.assign({
+      referrer: location.href,
+      referrerPolicy: 'strict-origin-when-cross-origin',
+      credentials: 'include',
+      cache: 'no-store'
+    }, extra||{});
+  }
+
+  
+  // =============== Fetch helpers ===============
+  async function POST_JSON(path, data, name, opts){
+    const url = path.startsWith("http") ? path : (API + path);
+    const headers = applyCommonHeaders({ "Content-Type":"application/json" }, opts);
+    const controller = new AbortController();
+    const mySeq = stopSeq;
+    const req = { controller, name, status: "Pending", seq: mySeq };
+    activeRequests.push(req); refreshActive();
+    try{
+      const res = await fetch(url, commonFetchOptions(Object.assign({ method:"POST", headers, body: JSON.stringify(data||{}), signal: controller.signal }, (opts && opts._fetch) ? opts._fetch : {})));
+      if (mySeq !== stopSeq) throw new Error("Stopped");
+      req.status = res.status; refreshActive();
+      const text = await res.text();
+      let json = null; try{ json = JSON.parse(text); }catch(_){ }
+      addLog(name, res.status, data, text);
+      return {res, text, json};
+    }catch(e){
+      if(e.name!=="AbortError"){ req.status="Error"; refreshActive(); addLog(name,"error",data,(e && e.message) ? e.message : String(e)); }
+      throw e;
+    }finally{
+      activeRequests = activeRequests.filter(x=>x!==req); refreshActive();
+    }
+  }
+  async function POST_FORM_URLENCODED(url, bodyStr, name, opts){
+    const headers = applyCommonHeaders({ "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8", "Accept":"application/json, text/plain, */*" }, opts);
+    const controller = new AbortController();
+    const mySeq = stopSeq;
+    const req = { controller, name, status: "Pending", seq: mySeq };
+    activeRequests.push(req); refreshActive();
+    try{
+      const res = await fetch(url, commonFetchOptions(Object.assign({ method:"POST", headers, body: bodyStr, signal: controller.signal }, (opts && opts._fetch) ? opts._fetch : {})));
+      if (mySeq !== stopSeq) throw new Error("Stopped");
+      req.status = res.status; refreshActive();
+      const text = await res.text();
+      let json = null; try{ json = JSON.parse(text); }catch(_){ }
+      addLog(name, res.status, bodyStr, text);
+      return {res, text, json};
+    }catch(e){
+      if(e.name!=="AbortError"){ req.status="Error"; refreshActive(); addLog(name,"error",bodyStr,(e && e.message) ? e.message : String(e)); }
+      throw e;
+    }finally{
+      activeRequests = activeRequests.filter(x=>x!==req); refreshActive();
+    }
+  }
+  async function GET(path, name, opts){
+    const url = path.startsWith("http") ? path : (API + path);
+    const headers = applyCommonHeaders({}, opts);
+    const controller = new AbortController();
+    const mySeq = stopSeq;
+    const req = { controller, name, status: "Pending", seq: mySeq };
+    activeRequests.push(req); refreshActive();
+    try{
+      const res = await fetch(url, commonFetchOptions(Object.assign({ method:"GET", headers, signal: controller.signal }, (opts && opts._fetch) ? opts._fetch : {})));
+      if (mySeq !== stopSeq) throw new Error("Stopped");
+      req.status = res.status; refreshActive();
+      const text = await res.text();
+      let json = null; try{ json = JSON.parse(text); }catch(_){ }
+      addLog(name, res.status, {}, text);
+      return {res, text, json};
+    }catch(e){
+      if(e.name!=="AbortError"){ req.status="Error"; refreshActive(); addLog(name,"error",{},(e && e.message) ? e.message : String(e)); }
+      throw e;
+    }finally{
+      activeRequests = activeRequests.filter(x=>x!==req); refreshActive();
+    }
+  }
+
+  function isSuccess(res,text,json){
+    if (!res) return false;
+    const ok2xx = res.status >= 200 && res.status < 300;
+    if (ok2xx && json && (json.success || json.status === "success")) return true;
+    if (ok2xx && (res.status === 204 || !text)) return true;
+    if (ok2xx && typeof text === "string" && /\b(success|valid|created|ok)\b/i.test(text)) return true;
+    return res.status === 200;
+  }
+
+  
+  // -------- Extract webfile from response (json or text) --------
+  function extractWebfileFromResponse(out){
+    try{
+      function walk(obj){
+        let found=null;
+        if(!obj || typeof obj!=='object') return null;
+        for(const k of Object.keys(obj)){
+          const v = obj[k];
+          const key = String(k).toLowerCase();
+          if(/web\s*file|webfile|web_file|webfile_id|webfile_no|web_file_no/.test(key)){
+            if(typeof v === 'string' && v.trim().length>=6){
+              return v.trim();
+            }
+          }
+          if(typeof v === 'object'){
+            found = walk(v); if(found) return found;
+          }
+        }
+        return null;
+      }
+      let wf = out && out.json ? walk(out.json) : null;
+      if(wf && typeof wf === 'string') return wf.trim();
+      const txt = (out && out.text) ? String(out.text) : "";
+      let m = txt.match(/(?:web[\s\-_]*file(?:\s*number)?\s*[:=]?\s*)([A-Za-z0-9\-\/_]{6,32})/i);
+      if(m && m[1]) return m[1].trim();
+    }catch(_){ }
+    return "";
+  }
+
+// =============== Retry wrapper ===============
+  async function withRetry(fn){
+    const mySeq = stopSeq;
+    while (true) {
+      if (mySeq !== stopSeq || hardStop) return { ok:false, stopped:true };
+      try {
+        const out = await fn();
+        if (mySeq !== stopSeq || hardStop) return { ok:false, stopped:true };
+        const status = out && out.res ? (out.res.status||0) : 0;
+
+        if (isSuccess(out.res, out.text, out.json)) return { ok:true, ...out };
+        if (!retryCB.checked)    return { ok:false, ...out };
+        if (!RETRYABLE.has(+status)) return { ok:false, ...out };
+
+        const waitSec = parseInt(retryDelaySecInp.value || "2", 10);
+        await new Promise(r=>setTimeout(r, (Number.isFinite(waitSec) ? waitSec : 2)*1000 ));
+      } catch (e) {
+        if (mySeq !== stopSeq || hardStop) return { ok:false, stopped:true };
+        if (!retryCB.checked) return { ok:false, error:e };
+        const waitSec = parseInt(retryDelaySecInp.value || "2", 10);
+        await new Promise(r=>setTimeout(r, (Number.isFinite(waitSec) ? waitSec : 2)*1000 ));
+      }
+    }
+  }
+// =============== Stop All ===============
+  function stopAll(){
+    stopSeq++; hardStop = true;
+    activeRequests.forEach(({controller})=>{ try{ controller.abort(); }catch(_){ } });
+    activeRequests = []; refreshActive();
+    [autoNextTimer, slotInfoHideTimer, otpInfoHideTimer, otpBannerHideTimer, loginCountdownTimer, otpCountdownTimer]
+      .forEach(t=>{ if(t){ try{clearInterval(t);}catch(_){ } try{clearTimeout(t);}catch(_){ } } });
+    clearScheduleTimers();
+    cancelAutoApplicationClick();
+    stopPayAutoRetry();
+    if(scheduleInfoEl) scheduleInfoEl.textContent = "Schedule cleared.";
+    setStatus("⛔ Stopped: requests/retries cancelled. ⏱️ Countdowns unaffected.");
+    setTimeout(()=>{ hardStop=false; setStatus("Ready for next request."); }, 800);
+  }
+
+  // =============== Login UI ===============
+  const mobileInp=input("Mobile (01XXXXXXXXX)"), passInp=input("Password","password"), loginOtpInp=input("Login OTP");
+  const passWrap=document.createElement("div"); passWrap.style.display="flex"; passWrap.style.gap="6px"; passWrap.append(passInp);
+  const showBtn=btn("👁","rgba(255,255,255,0.08)"); showBtn.style.color="#eaeef2"; showBtn.onclick=()=>{ passInp.type = (passInp.type==="password") ? "text" : "password"; };
+  passWrap.append(showBtn);
+
+  const btnMobileVerify=btn("Mobile Verify","#0d6efd"), btnPassLogin=btn("Pass Login","#198754"), btnLoginOTP=btn("Login+OTP","#0aa2c0");
+  const loginTimerLine=document.createElement("div"); loginTimerLine.style.fontSize="12px"; loginTimerLine.style.opacity = 0.85;
+
+  const loginSec = section("Login Info");
+  loginSec.body.append(row(mobileInp,passWrap,loginOtpInp));
+  box.append(loginSec.wrap);
+  box.append(row(btnMobileVerify,btnPassLogin,btnLoginOTP), loginTimerLine);
+
+  const autoOpenApplicationWrap = document.createElement("label");
+  Object.assign(autoOpenApplicationWrap.style,{display:"flex",alignItems:"center",gap:"6px",cursor:"pointer"});
+  autoOpenApplicationWrap.style.flex = "1 1 0";
+  autoOpenApplicationCB = document.createElement("input");
+  autoOpenApplicationCB.type = "checkbox";
+  autoOpenApplicationCB.style.width = "16px";
+  autoOpenApplicationCB.style.height = "16px";
+  autoOpenApplicationCB.checked = !!autoOpenApplicationAfterLogin;
+  const autoOpenApplicationText = document.createElement("span");
+  autoOpenApplicationText.textContent = "Open Application page after login";
+  autoOpenApplicationWrap.append(autoOpenApplicationCB, autoOpenApplicationText);
+  autoOpenApplicationCB.onchange = ()=>{
+    autoOpenApplicationAfterLogin = !!autoOpenApplicationCB.checked;
+    try{
+      if(autoOpenApplicationAfterLogin){ localStorage.setItem("auto_open_application_tab", "1"); }
+      else { localStorage.setItem("auto_open_application_tab", "0"); }
+      localStorage.setItem("auto_open_application_tab_version", "2");
+    }catch(_){ }
+  };
+  box.append(row(autoOpenApplicationWrap));
+
+  // ===== Token box =====
+  const tokenInp = input("Authorization (Bearer ...)");
+  const btnSetToken = btn("Set Token","#6c757d");
+  const btnCopyToken = btn("Copy","#6c757d");
+  btnSetToken.onclick = ()=>{
+    const v = tokenInp.value.trim();
+    if(!v){ setStatus("⚠️ Empty token."); return; }
+    authToken = v.startsWith("Bearer ") ? v : ("Bearer " + v);
+    try{
+      const parts = authToken.split(" ");
+      localStorage.setItem("authToken", parts.slice(1).join(" ") || "");
+      localStorage.setItem("tokenType", parts[0] || "Bearer");
+      localStorage.setItem("access_token", parts.slice(1).join(" ") || "");
+    }catch(_){ }
+    handleAuthTokenAvailable();
+    setStatus("🔐 Token set for Authorization header.");
+  };
+  btnCopyToken.onclick = ()=>{
+    try{ tokenInp.select(); document.execCommand("copy"); setStatus("📋 Token copied."); }catch(_){ setStatus("⚠️ Copy failed."); }
+  };
+  box.append(row(tokenInp, btnSetToken, btnCopyToken));
+  const capMonsterKeyInput = input("CapMonster API key");
+  capMonsterKeyInput.value = capMonsterClientKey || "";
+  const btnSaveCapMonsterKey = btn("Save Key","#6c757d");
+  const btnAutoSolveAll = btn("Auto Solve Captchas","#20c997");
+  const capMonsterInfo = document.createElement("div");
+  Object.assign(capMonsterInfo.style,{fontSize:"12px",opacity:0.85,margin:"4px 0 12px"});
+  capMonsterInfo.textContent = hasCapMonsterKey() ? "🤖 CapMonster ready." : "❗ Provide CapMonster key to auto solve.";
+  btnSaveCapMonsterKey.onclick = ()=>{
+    capMonsterClientKey = capMonsterKeyInput.value.trim();
+    try{
+      if(capMonsterClientKey){ localStorage.setItem("capmonster_client_key", capMonsterClientKey); }
+      else { localStorage.removeItem("capmonster_client_key"); }
+    }catch(_){ }
+    const hasKey = hasCapMonsterKey();
+    capMonsterInfo.textContent = hasKey ? "✅ CapMonster key saved." : "❗ CapMonster key cleared.";
+    setStatus(hasKey ? "✅ CapMonster key saved." : "ℹ️ CapMonster key cleared.");
+    if(autoSolveEnabled){
+      if(hasKey){ autoSolveAllCaptchas("auto").catch(()=>{}); }
+      else { setAutoSolveEnabled(false); }
+    }
+  };
+  btnAutoSolveAll.onclick = ()=>{ autoSolveAllCaptchas(); };
+  box.append(row(capMonsterKeyInput, btnSaveCapMonsterKey, btnAutoSolveAll));
+  const autoSolveToggleWrap = document.createElement("label");
+  Object.assign(autoSolveToggleWrap.style,{display:"flex",alignItems:"center",gap:"6px",cursor:"pointer"});
+  autoSolveToggleWrap.style.flex = "1 1 0";
+  const autoSolveCaptchaCB = document.createElement("input");
+  autoSolveCaptchaCB.type = "checkbox";
+  autoSolveCaptchaCB.style.width = "16px";
+  autoSolveCaptchaCB.style.height = "16px";
+  const autoSolveToggleText = document.createElement("span");
+  autoSolveToggleText.textContent = "Auto Solve Captchas (auto mode)";
+  autoSolveToggleWrap.append(autoSolveCaptchaCB, autoSolveToggleText);
+  box.append(row(autoSolveToggleWrap));
+  autoSolveCaptchaCB.checked = autoSolvePrefFromStorage;
+  autoSolveCaptchaCB.onchange = ()=>{ setAutoSolveEnabled(autoSolveCaptchaCB.checked); };
+  box.append(capMonsterInfo);
+  const autoAppClickDelayLabel = label("Auto Application click delay (sec)");
+  const autoAppClickDelayOptions = [
+    ["15 sec","15"],
+    ["30 sec","30"],
+    ["45 sec (default)","45"],
+    ["60 sec","60"],
+    ["90 sec","90"],
+    ["120 sec","120"],
+    ["Custom","custom"]
+  ];
+  const autoAppClickDelaySelect = select(autoAppClickDelayOptions);
+  autoAppClickDelaySelect.style.maxWidth = "180px";
+  autoAppClickDelaySelect.style.flex = "0 0 auto";
+  const autoAppClickDelayCustom = input("Custom delay (sec)", "number");
+  autoAppClickDelayCustom.min = "0";
+  autoAppClickDelayCustom.step = "5";
+  autoAppClickDelayCustom.style.maxWidth = "140px";
+  autoAppClickDelayCustom.style.flex = "0 0 auto";
+  autoAppClickDelayCustom.style.display = "none";
+  const autoAppClickDelayRow = row(autoAppClickDelaySelect, autoAppClickDelayCustom);
+  autoAppClickDelayRow.style.justifyContent = "flex-start";
+  const presetDelayValues = autoAppClickDelayOptions
+    .map(([,value])=>value)
+    .filter(value => value !== "custom");
+  const syncAutoAppDelayUI = (sec)=>{
+    const secStr = String(sec);
+    if(presetDelayValues.includes(secStr)){
+      autoAppClickDelaySelect.value = secStr;
+      autoAppClickDelayCustom.style.display = "none";
+      autoAppClickDelayCustom.value = secStr;
+    } else {
+      autoAppClickDelaySelect.value = "custom";
+      autoAppClickDelayCustom.style.display = "";
+      autoAppClickDelayCustom.value = secStr;
+    }
+  };
+  syncAutoAppDelayUI(autoAppClickDelaySec);
+  autoAppClickDelaySelect.onchange = ()=>{
+    if(autoAppClickDelaySelect.value === "custom"){
+      autoAppClickDelayCustom.style.display = "";
+      autoAppClickDelayCustom.focus();
+      return;
+    }
+    applyAutoAppClickDelay(autoAppClickDelaySelect.value, {rescheduleExisting:true});
+    syncAutoAppDelayUI(autoAppClickDelaySec);
+  };
+  const handleCustomDelayChange = ()=>{
+    const val = parseInt(autoAppClickDelayCustom.value, 10);
+    if(Number.isNaN(val)) return;
+    applyAutoAppClickDelay(val, {rescheduleExisting:true});
+    syncAutoAppDelayUI(autoAppClickDelaySec);
+  };
+  autoAppClickDelayCustom.addEventListener("change", handleCustomDelayChange);
+  autoAppClickDelayCustom.addEventListener("blur", handleCustomDelayChange);
+  const autoAppClickLabelRow = document.createElement("div");
+  Object.assign(autoAppClickLabelRow.style,{display:"flex",alignItems:"center",gap:"8px",marginTop:"6px",marginBottom:"4px"});
+  autoAppCountdownEl = document.createElement("span");
+  Object.assign(autoAppCountdownEl.style,{fontSize:"12px",opacity:0.85,display:"none",flex:"0 0 auto",whiteSpace:"nowrap"});
+  autoAppClickDelayLabel.style.marginBottom = "0";
+  autoAppClickLabelRow.append(autoAppClickDelayLabel, autoAppCountdownEl);
+  box.append(autoAppClickLabelRow, autoAppClickDelayRow);
+  (function initTokenFromStorage(){
+    try{
+      const t = localStorage.getItem("authToken") || localStorage.getItem("access_token");
+      const ty = localStorage.getItem("tokenType") || "Bearer";
+      if(t){
+        authToken = `${ty} ${t}`;
+        tokenInp.value = authToken;
+        handleAuthTokenAvailable();
+      }
+    }catch(_){ }
+  })();
+
+  // ===== LocalStorage Sync helpers & button =====
+  function __ls(k, d=null){ try{ return localStorage.getItem(k) ?? d; }catch(_){ return d; } }
+  function __parse(s){ try{ return JSON.parse(s); }catch(_){ return null; } }
+  function syncFromLocalStorage(){
+    try{
+      const acc = __ls("access_token","");
+      if(acc && (!authToken || !authToken.includes(acc))){
+        authToken = "Bearer " + acc;
+        try{ tokenInp.value = authToken; }catch(_){ }
+        handleAuthTokenAvailable();
+      }
+      // Prefill login & personal info if empty
+      const nm = __ls("auth_name","") || __ls("user_name","");
+      if(nm && !pFullName.value) pFullName.value = nm;
+      const em = (__ls("user_email","") || __ls("auth_email","")).replace(/^"+|"+$/g,"");
+      if(em && !pEmail.value) pEmail.value = em;
+      const ph = __ls("user_phone","") || __ls("auth_phone","");
+      if(ph && !pPhone.value) pPhone.value = ph;
+      if(ph && !mobileInp.value) mobileInp.value = ph;
+
+      const init = __parse(__ls("initialData",""));
+      if(init && init.centers && init.centers.length && init.centers[0].id){
+        try{ ivacSel.value = String(init.centers[0].id); }catch(_){ }
+      }
+      if(!localStorage.getItem("language")) localStorage.setItem("language","en");
+      setStatus("🔄 Synced from Local Storage.");
+    }catch(_){ /* ignore */ }
+  }
+  const btnSyncLS = btn("Sync LS","#6c757d");
+  btnSyncLS.onclick = syncFromLocalStorage;
+  box.append(row(btnSyncLS));
+  (function(){
+    let last = __ls("access_token","");
+    setInterval(()=>{
+      const cur = __ls("access_token","");
+      if(cur && cur !== last){
+        last = cur;
+        authToken = "Bearer " + cur;
+        try{ tokenInp.value = authToken; }catch(_){ }
+        handleAuthTokenAvailable();
+        setStatus("✅ Token updated from Local Storage.");
+      }
+    }, 3000);
+  })();
+
+  // =============== Cloudifier (Shared) ===============
+  const sharedCloudWrap = document.createElement("div");
+  Object.assign(sharedCloudWrap.style,{border:"1px dashed #2a2f36",borderRadius:"10px",padding:"10px",margin:"8px 0"});
+  const sharedCloudTitle = document.createElement("div"); sharedCloudTitle.textContent = "Cloudifier (Shared)"; sharedCloudTitle.style.fontWeight="700";
+  const sharedCloudInfo = document.createElement("div"); sharedCloudInfo.style.fontSize="12px"; sharedCloudInfo.style.opacity=.85;
+  const sharedCloudHost = document.createElement("div"); sharedCloudHost.style.minHeight = "80px";
+  const btnLoadCloudShared = btn("Load Cloudifier","#6c757d");
+  const btnResetCloudShared = btn("Reset","#6c757d");
+  autoTokShared = input("Captcha token (auto)"); autoTokShared.readOnly = true;
+  manualTokShared = input("Manual Captcha Token (optional)");
+  sharedCloudWrap.append(
+    sharedCloudTitle, sharedCloudInfo, sharedCloudHost,
+    row(autoTokShared), row(manualTokShared), row(btnLoadCloudShared, btnResetCloudShared)
+  );
+  loginSec.body.append(sharedCloudWrap);
+
+  function renderCloudifierShared(){
+    sharedCloudInfo.textContent = "ℹ️ Solve the challenge…";
+    sharedCloudHost.innerHTML = "";
+    sharedCloudWidgetId = window.turnstile.render(sharedCloudHost, {
+      sitekey: SITEKEY_SHARED, theme: "dark", retry: "auto", execution: "execute",
+      callback: (token)=>{ cloudifierTokenShared = token; autoTokShared.value = token; sharedCloudInfo.textContent = "✅ Verified."; beep(); },
+      "expired-callback": ()=>{ cloudifierTokenShared = null; autoTokShared.value=""; sharedCloudInfo.textContent = "⚠️ Expired. Reload."; },
+      "error-callback": ()=>{ cloudifierTokenShared = null; autoTokShared.value=""; sharedCloudInfo.textContent = "❌ Error. Reload."; }
+    });
+    autoSolveTurnstile(sharedCloudWidgetId, sharedCloudInfo, ()=>cloudifierTokenShared);
+  }
+  btnLoadCloudShared.onclick = ()=>{ ensureTurnstile().then(renderCloudifierShared).catch(e=>{ sharedCloudInfo.textContent="❌ "+(e&&e.message||"Turnstile failed"); }); };
+  btnResetCloudShared.onclick = ()=>{ cloudifierTokenShared = null; if(sharedCloudWidgetId){ try{ window.turnstile.reset(sharedCloudWidgetId); }catch(_){ } } sharedCloudWidgetId = null; sharedCloudHost.innerHTML=""; sharedCloudInfo.textContent="↻ Reset done. Click Load Cloudifier."; autoTokShared.value=""; manualTokShared.value=""; };
+  manualTokShared.addEventListener("input", ()=>{
+    if(manualTokShared && manualTokShared.value && manualTokShared.value.trim()){
+      try{ sharedCloudInfo.textContent = "✋ Manual token supplied."; }catch(_){ }
+    }
+  });
+
+  async function solveSharedCaptchaViaCapMonster(autoTriggered=false){
+    if(sharedCapMonsterInFlight) return null;
+    if(autoTriggered && scheduleInfoEl){
+      try{ scheduleInfoEl.textContent = "🤖 CapMonster solving shared captcha…"; }catch(_){ }
+    }
+    sharedCapMonsterInFlight = true;
+    try{
+      const token = await capMonsterSolve(SITEKEY_SHARED, location.href, sharedCloudInfo);
+      cloudifierTokenShared = token;
+      autoTokShared.value = token;
+      try{ sharedCloudInfo.textContent = "✅ CapMonster token ready."; }catch(_){ }
+      if(autoTriggered && scheduleInfoEl){
+        try{ scheduleInfoEl.textContent = `${describeSchedule(scheduleTargetTs)} — ✅ Captcha ready.`; }catch(_){ }
+      }
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = "✅ Shared captcha solved via CapMonster."; }catch(_){ }
+      setStatus("✅ Shared captcha solved via CapMonster.");
+      beep();
+      return token;
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err);
+      try{ sharedCloudInfo.textContent = `❌ CapMonster failed: ${msg}`; }catch(_){ }
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = `❌ Shared captcha failed: ${msg}`; }catch(_){ }
+      setStatus(`❌ CapMonster (shared) failed: ${msg}`);
+      throw err;
+    }finally{
+      sharedCapMonsterInFlight = false;
+    }
+  }
+
+  const bdFormatter = (function(){
+    try {
+      return new Intl.DateTimeFormat('en-US',{
+        timeZone:'Asia/Dhaka',
+        hour12:true,
+        hour:'2-digit',
+        minute:'2-digit',
+        second:'2-digit'
+      });
+    } catch(_){ return null; }
+  })();
+  const formatBDTime = (date)=>{
+    if(bdFormatter){
+      return bdFormatter.format(date);
+    }
+    const pad=(n)=>String(n).padStart(2,"0");
+    const utcMs = date.getTime() + date.getTimezoneOffset()*60000;
+    const bdDate = new Date(utcMs + 6*60*60000);
+    const hours24 = bdDate.getHours();
+    const suffix = hours24 >= 12 ? "PM" : "AM";
+    const hour12 = ((hours24 + 11) % 12) + 1;
+    return `${pad(hour12)}:${pad(bdDate.getMinutes())}:${pad(bdDate.getSeconds())} ${suffix}`;
+  };
+
+  const bdTimeDisplay = document.createElement("div");
+  Object.assign(bdTimeDisplay.style,{fontSize:"12px",opacity:0.85,margin:"6px 0"});
+  const scheduleTimeInput = input("Schedule Time (BD)","time");
+  scheduleTimeInput.step = "1";
+  scheduleTimeInput.value = "18:00:05";
+  scheduleTimeInput.style.minWidth = "140px";
+  const btnScheduleMobileVerify = btn("Schedule Verify","#0d6efd");
+  const btnCancelSchedule = btn("Cancel","#6c757d");
+  const scheduleInfo = document.createElement("div");
+  scheduleInfoEl = scheduleInfo;
+  Object.assign(scheduleInfo.style,{fontSize:"12px",opacity:0.85,marginBottom:"8px"});
+  scheduleInfo.textContent = "No schedule set.";
+  const scheduleRow = row(scheduleTimeInput, btnScheduleMobileVerify, btnCancelSchedule);
+  scheduleCountdownEl = document.createElement("span");
+  Object.assign(scheduleCountdownEl.style,{fontSize:"12px",opacity:0.85,flex:"0 0 auto",display:"none",whiteSpace:"nowrap",marginLeft:"8px"});
+  scheduleRow.append(scheduleCountdownEl);
+  loginSec.body.append(bdTimeDisplay, scheduleRow, scheduleInfo);
+
+  const updateBDTime=()=>{
+    try{ bdTimeDisplay.textContent = `🇧🇩 Bangladesh Time: ${formatBDTime(new Date())}`; }
+    catch(_){ bdTimeDisplay.textContent = "🇧🇩 Bangladesh Time: --:--:--"; }
+  };
+  updateBDTime();
+  setInterval(updateBDTime, 1000);
+
+  function getMsUntilNextBDTime(timeStr){
+    if(!timeStr) return null;
+    const parts = timeStr.split(":").map(Number);
+    if(parts.some(n=>Number.isNaN(n))) return null;
+    const hour = parts[0] ?? 0;
+    const minute = parts[1] ?? 0;
+    const second = parts[2] ?? 0;
+    if(hour<0 || hour>23 || minute<0 || minute>59 || second<0 || second>59) return null;
+    const now = new Date();
+    const nowUtc = now.getTime() + now.getTimezoneOffset()*60000;
+    const bdOffset = 6*60*60000;
+    const nowBd = new Date(nowUtc + bdOffset);
+    const targetBd = new Date(nowBd);
+    targetBd.setHours(hour, minute, second, 0);
+    if(targetBd <= nowBd){ targetBd.setDate(targetBd.getDate()+1); }
+    const targetUtc = targetBd.getTime() - bdOffset;
+    return targetUtc - nowUtc;
+  }
+
+  const describeSchedule = (ts)=>{
+    if(!ts) return "No schedule set.";
+    try{ return `🕒 Scheduled for ${formatBDTime(new Date(ts))} (BD)`; }
+    catch(_){ return "🕒 Scheduled."; }
+  };
+
+  function maybePreloadSharedCaptcha(){
+    const hasManualShared = !!(manualTokShared && manualTokShared.value && manualTokShared.value.trim());
+    if(!hasManualShared && !cloudifierTokenShared && !autoSolveEnabled){
+      setAutoSolveEnabled(true);
+    }
+    if(!autoSolveEnabled) return;
+    if(scheduleTargetTs && scheduleInfoEl){
+      scheduleInfoEl.textContent = `${describeSchedule(scheduleTargetTs)} — Preparing captcha…`;
+    }
+    if(hasManualShared || cloudifierTokenShared){ return; }
+    if(hasCapMonsterKey()){
+      solveSharedCaptchaViaCapMonster(true).catch(e=>{
+        const msg = (e && e.message) ? e.message : String(e);
+        setStatus(`⚠️ CapMonster shared solve failed: ${msg}`);
+      });
+      return;
+    }
+    ensureTurnstile().then(()=>{
+      if(!cloudifierTokenShared){ renderCloudifierShared(); }
+    }).catch(e=>{
+      setStatus(`⚠️ Auto captcha load failed: ${(e&&e.message)||e||"Turnstile"}`);
+    });
+  }
+
+  btnScheduleMobileVerify.onclick = ()=>{
+    const timeVal = scheduleTimeInput.value || "";
+    const delayMs = getMsUntilNextBDTime(timeVal);
+    if(!delayMs || delayMs <= 0){
+      setStatus("❌ Invalid schedule time.");
+      if(scheduleInfoEl) scheduleInfoEl.textContent = "❌ Invalid schedule time.";
+      return;
+    }
+    clearScheduleTimers();
+    scheduleTargetTs = Date.now() + delayMs;
+    startScheduleCountdown(scheduleTargetTs);
+    if(scheduleInfoEl) scheduleInfoEl.textContent = describeSchedule(scheduleTargetTs);
+    setStatus(`🕒 Mobile verify scheduled for ${formatBDTime(new Date(scheduleTargetTs))} (BD).`);
+    if(delayMs <= 30000){
+      maybePreloadSharedCaptcha();
+    } else {
+      schedulePreloadTimer = setTimeout(()=>{
+        schedulePreloadTimer = null;
+        maybePreloadSharedCaptcha();
+      }, delayMs - 30000);
+    }
+    scheduleTimer = setTimeout(()=>{
+      scheduleTimer = null;
+      stopScheduleCountdown();
+      scheduleTargetTs = null;
+      if(scheduleInfoEl) scheduleInfoEl.textContent = "▶️ Running scheduled Mobile Verify…";
+      setStatus("▶️ Running scheduled Mobile Verify.");
+      btnMobileVerify.click();
+      if(authToken){
+        handleAuthTokenAvailable();
+        setTimeout(()=>{
+          try{ btnApplication.click(); }catch(_){ }
+        }, 1000);
+      }
+    }, delayMs);
+  };
+
+  btnCancelSchedule.onclick = ()=>{
+    clearScheduleTimers();
+    if(scheduleInfoEl) scheduleInfoEl.textContent = "Schedule cleared.";
+    setStatus("⛔ Schedule cleared.");
+  };
+
+  function startLoginCountdown(){
+    loginSessionEndTs = Date.now() + 60*60*1000;
+    if (loginCountdownTimer) { clearInterval(loginCountdownTimer); loginCountdownTimer = null; }
+    const tick = ()=>{
+      if (!loginSessionEndTs){ return; }
+      const left = loginSessionEndTs - Date.now();
+      if (left <= 0){
+        loginTimerLine.textContent = "⚠️ Session expired.";
+        clearInterval(loginCountdownTimer); loginCountdownTimer = null; loginSessionEndTs = null;
+        return;
+      }
+      const m = Math.floor(left/60000), s = Math.floor((left%60000)/1000);
+      loginTimerLine.textContent = `🕒 Session ends in ${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+    };
+    tick();
+    loginCountdownTimer = setInterval(tick, 1000);
+  }
+  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState==="visible" && loginSessionEndTs){ const left = loginSessionEndTs - Date.now(); if(left>0){ const m=Math.floor(left/60000), s=Math.floor((left%60000)/1000); loginTimerLine.textContent=`🕒 Session ends in ${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`; }}});
+
+  // =============== Steps (Login) ===============
+  async function stepMobileVerify(){
+  const mobile=mobileInp.value.trim();
+  const token = (manualTokShared.value.trim() || cloudifierTokenShared || "");
+  if(!/^01[3-9]\d{8}$/.test(mobile)){ setStatus("❌ Invalid mobile."); return false; }
+  if(!token){ setStatus("❗ Captcha token needed. Use Shared Cloudifier."); return false; }
+
+  const payload = { mobile_no: mobile, captcha_token: token };
+  const out = await withRetry(()=>POST_JSON("/mobile-verify", payload, "Mobile Verify", {
+    _fetch: { referrer: REF_ROOT }
+  }));
+  const ok = out.ok || out.okExplicit;
+  if (ok) {
+    try {
+      localStorage.setItem("user_phone", mobile);
+      if (!localStorage.getItem("language")) localStorage.setItem("language","en");
+      localStorage.setItem("authStep","3");
+    } catch(_) {}
+  }
+  setStatus(ok?"✅ Mobile verified.":"❌ Mobile verify failed.");
+  if(ok) beep(); 
+  return ok;
+}
+
+async function stepPasswordLogin(){
+  const mobile=mobileInp.value.trim(), password=passInp.value.trim();
+  if(!/^01[3-9]\d{8}$/.test(mobile) || !password){ setStatus("❌ Mobile/Password required."); return false; }
+  const out = await withRetry(()=>POST_JSON("/jktwdasf-345432-afawerk",{mobile_no:mobile,password},"Password Login", {
+    _fetch: { referrer: REF_ROOT }
+  }));
+  const ok = out.ok || out.okExplicit;
+  if (ok) {
+    try {
+      localStorage.setItem("user_phone", mobile);
+      localStorage.setItem("user_pwd", password);
+      const em = out?.json?.data?.email || "";
+      if (em) localStorage.setItem("user_email", em);
+      if (!localStorage.getItem("language")) localStorage.setItem("language","en");
+      localStorage.setItem("authStep","100");
+    } catch(_) {}
+  }
+  setStatus(ok?"✅ Password accepted. Enter Login OTP.":"❌ Login failed.");
+  if(ok) { passLoginCompleted = true; beep(); }
+  return ok;
+}
+  async function stepLoginWithOTP(){
+  const mobile=mobileInp.value.trim(), password=passInp.value.trim(), otp=loginOtpInp.value.trim();
+  if(!/^01[3-9]\d{8}$/.test(mobile) || !password || !otp){ setStatus("❌ Mobile/Password/Login OTP required."); return false; }
+  const out=await withRetry(()=>POST_JSON("/login-otp",{mobile_no:mobile,password,otp},"Login OTP", {
+    _fetch: { referrer: REF_ROOT }
+  }));
+  if((out.ok || out.okExplicit) && out.json?.data?.access_token){
+    authToken = (out.json.data.token_type||"Bearer")+" "+out.json.data.access_token;
+    tokenInp.value = authToken;
+    try{
+      localStorage.setItem("authToken", out.json.data.access_token);
+      localStorage.setItem("access_token", out.json.data.access_token);
+      localStorage.setItem("tokenType", out.json.data.token_type||"Bearer");
+      localStorage.setItem("auth_phone", mobile);
+      localStorage.setItem("user_phone", mobile);
+      if (!localStorage.getItem("language")) localStorage.setItem("language","en");
+      localStorage.setItem("authStep","100");
+      localStorage.setItem("activeStep","1");
+
+      const data = out.json.data || {};
+      const nm  = data.name || data.full_name || "";
+      const em  = data.email || "";
+      const ph  = data.mobile_no || data.phone || "";
+      const pic = data.profile_image || data.photo || data.avatar || "";
+
+      if (nm) { localStorage.setItem("auth_name", nm); localStorage.setItem("user_name", nm); }
+      if (em) { localStorage.setItem("auth_email", em); localStorage.setItem("user_email", em); }
+      if (ph) { if(!localStorage.getItem("auth_phone")) localStorage.setItem("auth_phone", ph);
+                if(!localStorage.getItem("user_phone")) localStorage.setItem("user_phone", ph); }
+      if (pic) { localStorage.setItem("auth_photo", pic); }
+      else if (localStorage.getItem("auth_photo")===null) { localStorage.setItem("auth_photo",""); }
+    }catch(_){ }
+    setStatus("✅ Login success.");
+    if(autoOpenApplicationAfterLogin){
+      try {
+        window.open("https://payment.ivacbd.com/application", "_blank", "noopener");
+      } catch(_){
+        try {
+          const a = document.createElement("a");
+          a.href = "https://payment.ivacbd.com/application";
+          a.target = "_blank";
+          a.rel = "noopener";
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(()=>{ try{ a.remove(); }catch(__){} }, 1000);
+        } catch(__){}
+      }
+    }
+    beep(); startLoginCountdown(); handleAuthTokenAvailable(); return true;
+  }
+  setStatus("❌ Login+OTP failed."); return false;
+}
+
+
+  // Wire login buttons
+  btnMobileVerify.onclick = async()=>{
+    clearScheduleTimers();
+    if(scheduleInfoEl) scheduleInfoEl.textContent = "Schedule cleared.";
+    if(await stepMobileVerify()) autoNextFrom("MobileVerify");
+  };
+  btnPassLogin.onclick    = async()=>{ if(await stepPasswordLogin()) autoNextFrom("Login"); };
+  btnLoginOTP.onclick     = async()=>{ if(await stepLoginWithOTP())  autoNextFrom("LoginOTP"); };
+  loginOtpInp.addEventListener("input",()=>{ if(autoCB.checked && passLoginCompleted && loginOtpInp.value.trim().length>=6){ btnLoginOTP.click(); } });
+
+  // =============== Application / Personal ===============
+  const appSec=section("Application Info"), perSec=section("Personal Info"); box.append(appSec.wrap, perSec.wrap);
+
+  const highcomSel=select([["Dhaka","1"],["Chittagong","2"],["Rajshahi","3"],["Sylhet","4"],["Khulna","5"]]); highcomSel.value="1";
+  const ivacSel=select([ ["IVAC-Dhaka","17"],["IVAC-Rajshahi","2"],["IVAC-Chittagong","5"],["IVAC-Khulna","3"],["IVAC-Sylhet","4"] ]); ivacSel.value="17";
+  const visaSel=select([ ["MEDICAL VISA","13"],["STUDENT VISA","2"],["ENTRY VISA","6"],["DOUBLE ENTRY VISA","19"], ["BUSINESS VISA","1"],["OTHERS VISA","18"] ]); visaSel.value="13";
+  const webfile=input("Webfile ID"), visitPurpose=input("Visit purpose"); visitPurpose.value="Medical Treatment";
+  const famCountSel=select([["0","0"],["1","1"],["2","2"],["3","3"],["4","4"]]); famCountSel.value="2";
+  appSec.body.append(row(highcomSel,ivacSel,visaSel), webfile, visitPurpose, row(label("Family Count"), famCountSel));
+
+  // Personal form
+  const pFullName=input("Applicant Full Name"), pEmail=input("Applicant Email"), pPhone=input("Applicant Phone (11 digits)");
+  const famFieldsWrap=document.createElement("div"); perSec.body.append(pFullName,pEmail,pPhone,famFieldsWrap);
+
+  // Readonly Webfile indicator (auto from Application)
+  const webfileRO = input("Webfile ID (auto)"); webfileRO.readOnly = true; webfileRO.placeholder = "Auto from Application";
+  (function initWebfileRO(){ try{ const v = localStorage.getItem('webfile_id') || localStorage.getItem('webfile') || ""; if (v) webfileRO.value = v; }catch(_){}})();
+  const __orig_setWebfileLS = (typeof setWebfileLS==='function') ? setWebfileLS : null;
+  window.setWebfileLS = function(v){ try{ if(__orig_setWebfileLS) __orig_setWebfileLS(v); }catch(_){ }
+    try{ if(v) webfileRO.value = v; }catch(_){ }
+  };
+  perSec.body.insertBefore(webfileRO, famFieldsWrap);
+
+  // Initial sync from Local Storage (after inputs exist)
+  
+try{
+  window.addEventListener("storage", function(){
+    try{
+      // re-sync helper inputs from LS
+      (function(){
+        const nm = (localStorage.getItem("auth_name") || localStorage.getItem("user_name") || "");
+        const em = (localStorage.getItem("user_email") || localStorage.getItem("auth_email") || "");
+        const ph = (localStorage.getItem("user_phone") || localStorage.getItem("auth_phone") || "");
+        const wf = (localStorage.getItem("webfile_id") || localStorage.getItem("webfile") || "");
+        if(nm && !pFullName.value) pFullName.value = nm;
+        if(em && !pEmail.value) pEmail.value = em.replace(/^"+|"+$/g,"");
+        if(ph && !pPhone.value) pPhone.value = ph;
+        if(wf){ try{ webfileRO.value = wf; }catch(_){ } }
+      })();
+      // reflect into site form
+      (function __mirror(){
+        const set = (el, v)=>{ if (!el || !v) return; if (el.value !== v) { el.value = v; try{ el.dispatchEvent(new Event('input',{bubbles:true})); }catch(_){ } try{ el.dispatchEvent(new Event('change',{bubbles:true})); }catch(_){ } } };
+        const nameEl  = document.querySelector('input[placeholder*="FULL NAME" i], input[name="full_name"]');
+        const emailEl = document.querySelector('input[placeholder*="EMAIL" i], input[type="email"]');
+        const phoneEl = document.querySelector('input[placeholder*="CONTACT" i], input[name="phone"], input[type="tel"]');
+        set(nameEl,  (pFullName.value||'').trim());
+        set(emailEl, (pEmail.value||'').trim());
+        set(phoneEl, (pPhone.value||'').trim());
+      })();
+    }catch(_){ }
+  });
+}catch(_){ }
+
+  try { syncFromLocalStorage(); } catch(_){ /* ignore */ }
+
+  // === Mirror helper inputs to site form & keep LocalStorage in sync ===
+  function __mirrorToSiteFields(){
+    const set = (el, v)=>{ if (!el || !v) return; if (el.value !== v) { el.value = v; try{ el.dispatchEvent(new Event('input',{bubbles:true})); }catch(_){ } try{ el.dispatchEvent(new Event('change',{bubbles:true})); }catch(_){ } } };
+    const nameEl  = document.querySelector('input[placeholder*="FULL NAME" i], input[name="full_name"]');
+    const emailEl = document.querySelector('input[placeholder*="EMAIL" i], input[type="email"]');
+    const phoneEl = document.querySelector('input[placeholder*="CONTACT" i], input[name="phone"], input[type="tel"]');
+    set(nameEl,  (pFullName.value||'').trim());
+    set(emailEl, (pEmail.value||'').trim());
+    set(phoneEl, (pPhone.value||'').trim());
+  }
+  try { __mirrorToSiteFields(); } catch(_){ }
+  ;[pFullName,pEmail,pPhone].forEach((el, idx)=>{
+    el.addEventListener('input', ()=>{
+      const v = (el.value||'').trim();
+      try{
+        if(idx===0){ localStorage.setItem('auth_name',v); localStorage.setItem('user_name',v); }
+        else if(idx===1){ localStorage.setItem('auth_email',v); localStorage.setItem('user_email',v); }
+        else { localStorage.setItem('auth_phone',v); localStorage.setItem('user_phone',v); }
+      }catch(_){ }
+      try{ __mirrorToSiteFields(); }catch(_){ }
+    });
+  });
+  try {
+    new MutationObserver(()=>{ try{ __mirrorToSiteFields(); }catch(_){ } })
+      .observe(document.body,{subtree:true,childList:true});
+  } catch(_){ }
+
+  function readFamilyDraft(){
+    const data={};
+    famFieldsWrap.querySelectorAll('[data-family-index]').forEach(box=>{
+      const i=box.getAttribute('data-family-index');
+      data[i]={name:box.querySelector('.f-name')?.value||'',wf:box.querySelector('.f-wf')?.value||'',wfr:box.querySelector('.f-wfr')?.value||''};
+    });
+    return data;
+  }
+  function renderFamilyFields(n){
+    const old=readFamilyDraft(); famFieldsWrap.innerHTML="";
+    for(let i=1;i<=n;i++){
+      const wrap=document.createElement("div"); wrap.setAttribute('data-family-index',String(i));
+      Object.assign(wrap.style,{border:"1px solid #2a2f36",borderRadius:"8px",padding:"8px",marginBottom:"8px",background:"#0d1116"});
+      const nI=input(`Family ${i} - Name`); nI.className="f-name";
+      const wfI=input(`Family ${i} - Webfile No`); wfI.className="f-wf";
+      const wfrI=input(`Family ${i} - Repeat Webfile No`); wfrI.className="f-wfr";
+      if(old[i]){ nI.value=old[i].name; wfI.value=old[i].wf; wfrI.value=old[i].wfr; }
+      wrap.append(nI,wfI,wfrI); famFieldsWrap.appendChild(wrap);
+    }
+  }
+  renderFamilyFields(parseInt(famCountSel.value,10)); famCountSel.onchange=()=>renderFamilyFields(parseInt(famCountSel.value,10));
+
+  // ========== Cloudifier (Application) ==========
+  const appCloudSec = section("Cloudifier (Application)");
+  appCloudSectionControl = appCloudSec;
+  const appCloudWrap = document.createElement("div");
+  Object.assign(appCloudWrap.style,{border:"1px dashed #2a2f36",borderRadius:"10px",padding:"10px",margin:"8px 0"});
+  const appCloudTitle = document.createElement("div"); appCloudTitle.textContent = "Cloudifier (Application)"; appCloudTitle.style.fontWeight="700";
+  const appCloudInfo = document.createElement("div"); appCloudInfo.style.fontSize="12px"; appCloudInfo.style.opacity=.85;
+  const appCloudHost = document.createElement("div"); appCloudHost.style.minHeight = "80px";
+  const btnLoadCloudApp = btn("Load Cloudifier","#6c757d");
+  const btnResetCloudApp = btn("Reset","#6c757d");
+  autoTokApp = input("Captcha token (auto)"); autoTokApp.readOnly = true;
+  manualTokApp = input("Manual Captcha Token (optional)");
+  appCloudWrap.append(
+    appCloudTitle, appCloudInfo, appCloudHost,
+    row(autoTokApp), row(manualTokApp), row(btnLoadCloudApp, btnResetCloudApp)
+  );
+  appCloudSec.body.append(appCloudWrap);
+  box.append(appCloudSec.wrap);
+  appCloudUiReady = true;
+  if(shouldAutoLoadAppCloudifier){ autoLoadApplicationCloudifierIfNeeded(); }
+  manualTokApp.addEventListener("input", ()=>{
+    const hasManual = !!(manualTokApp && manualTokApp.value && manualTokApp.value.trim());
+    if(hasManual){
+      shouldAutoLoadAppCloudifier = false;
+    } else if(autoSolveEnabled){
+      requestAutoApplicationCloudifier();
+    }
+  });
+
+  function renderCloudifierApp(){
+    appCloudInfo.textContent = "ℹ️ Solve the challenge for Application…";
+    appCloudHost.innerHTML = "";
+    appCloudWidgetId = window.turnstile.render(appCloudHost, {
+      sitekey: SITEKEY_APPLICATION, theme: "dark", retry: "auto", execution: "execute",
+      callback: (token)=>{ cloudifierTokenApp = token; autoTokApp.value = token; appCloudInfo.textContent = "✅ Verified (Application)."; beep(); },
+      "expired-callback": ()=>{
+        cloudifierTokenApp = null;
+        autoTokApp.value="";
+        appCloudInfo.textContent = "⚠️ Expired. Reload.";
+        shouldAutoLoadAppCloudifier = autoSolveEnabled;
+        if(autoSolveEnabled){ autoLoadApplicationCloudifierIfNeeded(); }
+        handleAuthTokenAvailable();
+      },
+      "error-callback": ()=>{
+        cloudifierTokenApp = null;
+        autoTokApp.value="";
+        appCloudInfo.textContent = "❌ Error. Reload.";
+        shouldAutoLoadAppCloudifier = autoSolveEnabled;
+        if(autoSolveEnabled){ autoLoadApplicationCloudifierIfNeeded(); }
+        handleAuthTokenAvailable();
+      }
+    });
+    autoSolveTurnstile(appCloudWidgetId, appCloudInfo, ()=>cloudifierTokenApp);
+  }
+  btnLoadCloudApp.onclick = ()=>{ ensureTurnstile().then(renderCloudifierApp).catch(e=>{ appCloudInfo.textContent="❌ "+(e&&e.message||"Turnstile failed"); }); };
+  btnResetCloudApp.onclick = ()=>{
+    cloudifierTokenApp = null;
+    if(appCloudWidgetId){ try{ window.turnstile.reset(appCloudWidgetId); }catch(_){ } }
+    appCloudWidgetId = null;
+    appCloudHost.innerHTML="";
+    autoTokApp.value="";
+    manualTokApp.value="";
+    appCloudInfo.textContent="↻ Reset done. Click Load Cloudifier.";
+    autoAppCloudInFlight = false;
+    shouldAutoLoadAppCloudifier = autoSolveEnabled;
+    if(shouldAutoLoadAppCloudifier && autoSolveEnabled){ autoLoadApplicationCloudifierIfNeeded(); }
+  };
+  async function solveApplicationCaptchaViaCapMonster(autoTriggered=false){
+    if(appCapMonsterInFlight) return null;
+    if(appCloudSectionControl && typeof appCloudSectionControl.open === "function"){ appCloudSectionControl.open(); }
+    appCapMonsterInFlight = true;
+    try{
+      const url = REF_APPLICATION;
+      const token = await capMonsterSolve(SITEKEY_APPLICATION || SITEKEY_SHARED, url, appCloudInfo);
+      cloudifierTokenApp = token;
+      autoTokApp.value = token;
+      try{ appCloudInfo.textContent = "✅ CapMonster token ready."; }catch(_){ }
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = "✅ Application captcha solved via CapMonster."; }catch(_){ }
+      if(autoTriggered){ shouldAutoLoadAppCloudifier = false; }
+      setStatus("✅ Application captcha solved via CapMonster.");
+      beep();
+      return token;
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err);
+      try{ appCloudInfo.textContent = `❌ CapMonster failed: ${msg}`; }catch(_){ }
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = `❌ Application captcha failed: ${msg}`; }catch(_){ }
+      setStatus(`❌ CapMonster (application) failed: ${msg}`);
+      throw err;
+    }finally{
+      appCapMonsterInFlight = false;
+    }
+  }
+  function autoLoadApplicationCloudifierIfNeeded(){
+    if(cloudifierTokenApp || (manualTokApp && manualTokApp.value && manualTokApp.value.trim())){
+      shouldAutoLoadAppCloudifier = false;
+      return;
+    }
+    if(!autoSolveEnabled || !shouldAutoLoadAppCloudifier || autoAppCloudInFlight) return;
+    if(hasCapMonsterKey()){
+      autoAppCloudInFlight = true;
+      solveApplicationCaptchaViaCapMonster(true).catch(()=>{
+        shouldAutoLoadAppCloudifier = true;
+      }).finally(()=>{ autoAppCloudInFlight = false; });
+      return;
+    }
+    if(!authToken) return;
+    autoAppCloudInFlight = true;
+    if(appCloudSectionControl && typeof appCloudSectionControl.open === "function"){ appCloudSectionControl.open(); }
+    try{ appCloudInfo.textContent = "⌛ Auto loading captcha…"; }catch(_){ }
+    ensureTurnstile().then(()=>{
+      cloudifierTokenApp = null;
+      renderCloudifierApp();
+      setTimeout(()=>{
+        if(!cloudifierTokenApp){ autoSolveTurnstile(appCloudWidgetId, appCloudInfo, ()=>cloudifierTokenApp); }
+      }, 400);
+    }).catch(e=>{
+      try{ appCloudInfo.textContent = "❌ Auto load failed: " + ((e&&e.message)||e||"Turnstile"); }catch(_){ }
+    }).finally(()=>{
+      autoAppCloudInFlight = false;
+    });
+  }
+
+  // Action buttons row (Application / Personal / Overview)
+  btnApplication = btn("Application","#495057");
+  const btnPersonal=btn("Personal","#495057"), btnOverview=btn("Overview","#495057");
+  const btnStopAll=btn("⛔ Stop All","#dc3545"); btnStopAll.style.width = "100%"; btnStopAll.onclick=stopAll;
+  box.append(row(btnApplication,btnPersonal,btnOverview), row(btnStopAll));
+
+  // =============== OTP / Slot / Payment UI ===============
+  const btnSendOTP=btn("Send OTP","#17a2b8"), btnResend=btn("Resend OTP","#ffc107");
+  const otpBanner=document.createElement("div");
+  Object.assign(otpBanner.style,{display:"none",marginTop:"6px",padding:"8px",borderRadius:"8px",background:"#0f5132",color:"#d1e7dd",border:"1px solid #0f5132",fontWeight:"600"});
+  const otpTimerLine=document.createElement("div"); otpTimerLine.style.fontSize="12px"; otpTimerLine.style.opacity = 0.85;
+  box.append(row(btnSendOTP,btnResend), otpBanner, otpTimerLine);
+
+  const otpInput=input("Enter OTP"), btnVerifyOTP=btn("Verify OTP","#28a745");
+  const otpVerifyInfo=document.createElement("div");
+  Object.assign(otpVerifyInfo.style,{display:"none",marginTop:"6px",padding:"8px",borderRadius:"8px",background:"#084298",color:"#cfe2ff",border:"1px solid #084298",fontWeight:"600"});
+  box.append(row(otpInput,btnVerifyOTP), otpVerifyInfo);
+
+  const dateInput=document.createElement("input"); dateInput.type="date";
+  Object.assign(dateInput.style,{padding:"10px",border:"1px solid #2a2f36",borderRadius:"8px",background:"#0d1116",color:"#eaeef2",flex:"1 1 0"});
+  const btnCalIcon=btn("📅","#495057"); btnCalIcon.style.padding="10px"; btnCalIcon.onclick=()=>{ if(dateInput.showPicker) dateInput.showPicker(); else dateInput.focus(); };
+  const btnSlotTime=btn("Slot Time","#6c757d");
+  const slotInfo=document.createElement("div");
+  Object.assign(slotInfo.style,{display:"none",marginTop:"6px",padding:"8px",borderRadius:"8px",background:"#664d03",color:"#fff3cd",border:"1px solid #664d03",fontWeight:"600"});
+  box.append(row(dateInput,btnCalIcon,btnSlotTime), slotInfo);
+
+  const paymentMap = {
+    visa:   { name:"VISA",   slug:"visacard",   link:"https://securepay.sslcommerz.com/gwprocess/v4/image/gw1/visa.png"   },
+    master: { name:"MASTER", slug:"mastercard", link:"https://securepay.sslcommerz.com/gwprocess/v4/image/gw1/master.png" }
+  };
+  const paymentSelect = select([["VISA","visa"],["MASTER","master"]]); paymentSelect.value="visa";
+  const timeSelect = select([["9","9"],["10","10"]]); timeSelect.value = "9";
+  box.append(row(paymentSelect, timeSelect));
+
+  // ========== Cloudifier (Pay Now) ==========
+  const payCloudWrap = document.createElement("div");
+  Object.assign(payCloudWrap.style,{border:"1px dashed #2a2f36",borderRadius:"10px",padding:"10px",margin:"8px 0"});
+  const payCloudTitle = document.createElement("div"); payCloudTitle.textContent = "Cloudifier (Pay Now)"; payCloudTitle.style.fontWeight="700";
+  const payCloudInfo = document.createElement("div"); payCloudInfo.style.fontSize="12px"; payCloudInfo.style.opacity=.85;
+  const payCloudHost = document.createElement("div"); payCloudHost.style.minHeight = "80px";
+  const btnLoadCloudPay = btn("Load Cloudifier","#6c757d");
+  const btnResetCloudPay = btn("Reset","#6c757d");
+  autoTokPay = input("Captcha token (auto)"); autoTokPay.readOnly = true;
+  manualTokPay = input("Manual Captcha Token (optional)");
+  payCloudWrap.append(
+    payCloudTitle, payCloudInfo, payCloudHost,
+    row(autoTokPay), row(manualTokPay), row(btnLoadCloudPay, btnResetCloudPay)
+  );
+  const payCloudSec = section("Cloudifier (Pay Now)");
+  payCloudSectionControl = payCloudSec;
+  payCloudSec.body.append(payCloudWrap);
+  box.append(payCloudSec.wrap);
+  payCloudUiReady = true;
+  if(shouldAutoLoadPayCloudifier){ autoLoadPayCloudifierIfNeeded(); }
+  manualTokPay.addEventListener("input", ()=>{
+    const hasManual = !!(manualTokPay && manualTokPay.value && manualTokPay.value.trim());
+    if(hasManual){
+      shouldAutoLoadPayCloudifier = false;
+    } else if(autoSolveEnabled){
+      requestAutoPayCloudifier();
+    }
+    if(hasManual){
+      payAutoRetryMaybeTrigger();
+    } else if(!cloudifierTokenPay){
+      if(payAutoRetryTimer){ try{ clearTimeout(payAutoRetryTimer); }catch(_){ } payAutoRetryTimer = null; }
+      stopPayRetryCountdown();
+      payAutoRetryPending = false;
+    }
+  });
+
+  function renderCloudifierPay(){
+    payCloudInfo.textContent = "ℹ️ Solve the challenge for Pay Now…";
+    payCloudHost.innerHTML = "";
+    payCloudWidgetId = window.turnstile.render(payCloudHost, {
+      sitekey: SITEKEY_PAYNOW, theme: "dark", retry: "auto", execution: "execute",
+      callback: (token)=>{ cloudifierTokenPay = token; autoTokPay.value = token; payCloudInfo.textContent = "✅ Verified (Pay Now)."; beep(); payAutoRetryMaybeTrigger(); },
+      "expired-callback": ()=>{
+        cloudifierTokenPay = null;
+        autoTokPay.value="";
+        payCloudInfo.textContent = "⚠️ Expired. Reload.";
+        shouldAutoLoadPayCloudifier = autoSolveEnabled;
+        if(autoSolveEnabled) autoLoadPayCloudifierIfNeeded();
+      },
+      "error-callback": ()=>{
+        cloudifierTokenPay = null;
+        autoTokPay.value="";
+        payCloudInfo.textContent = "❌ Error. Reload.";
+        shouldAutoLoadPayCloudifier = autoSolveEnabled;
+        if(autoSolveEnabled) autoLoadPayCloudifierIfNeeded();
+      }
+    });
+    autoSolveTurnstile(payCloudWidgetId, payCloudInfo, ()=>cloudifierTokenPay);
+  }
+  btnLoadCloudPay.onclick = ()=>{ ensureTurnstile().then(renderCloudifierPay).catch(e=>{ payCloudInfo.textContent="❌ "+(e&&e.message||"Turnstile failed"); }); };
+  btnResetCloudPay.onclick = ()=>{
+    cloudifierTokenPay = null;
+    if(payCloudWidgetId){ try{ window.turnstile.reset(payCloudWidgetId); }catch(_){ } }
+    payCloudWidgetId = null;
+    payCloudHost.innerHTML="";
+    payCloudInfo.textContent="↻ Reset done. Click Load Cloudifier.";
+    autoTokPay.value="";
+    manualTokPay.value="";
+    autoPayCloudInFlight = false;
+    shouldAutoLoadPayCloudifier = autoSolveEnabled;
+    stopPayAutoRetry();
+    if(shouldAutoLoadPayCloudifier && autoSolveEnabled) autoLoadPayCloudifierIfNeeded();
+  };
+  async function solvePayCaptchaViaCapMonster(autoTriggered=false){
+    if(payCapMonsterInFlight) return null;
+    if(payCloudSectionControl && typeof payCloudSectionControl.open === "function"){ payCloudSectionControl.open(); }
+    payCapMonsterInFlight = true;
+    try{
+      const url = REF_APPLICATION;
+      const token = await capMonsterSolve(SITEKEY_PAYNOW || SITEKEY_SHARED, url, payCloudInfo);
+      cloudifierTokenPay = token;
+      autoTokPay.value = token;
+      try{ payCloudInfo.textContent = "✅ CapMonster token ready."; }catch(_){ }
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = "✅ Pay captcha solved via CapMonster."; }catch(_){ }
+      if(autoTriggered){ shouldAutoLoadPayCloudifier = false; }
+      setStatus("✅ Pay captcha solved via CapMonster.");
+      beep();
+      payAutoRetryMaybeTrigger();
+      return token;
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err);
+      try{ payCloudInfo.textContent = `❌ CapMonster failed: ${msg}`; }catch(_){ }
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = `❌ Pay captcha failed: ${msg}`; }catch(_){ }
+      setStatus(`❌ CapMonster (pay) failed: ${msg}`);
+      throw err;
+    }finally{
+      payCapMonsterInFlight = false;
+    }
+  }
+  function autoLoadPayCloudifierIfNeeded(){
+    if(cloudifierTokenPay || (manualTokPay && manualTokPay.value && manualTokPay.value.trim())){
+      shouldAutoLoadPayCloudifier = false;
+      return;
+    }
+    if(!autoSolveEnabled || !shouldAutoLoadPayCloudifier || autoPayCloudInFlight) return;
+    if(hasCapMonsterKey()){
+      autoPayCloudInFlight = true;
+      solvePayCaptchaViaCapMonster(true).catch(()=>{
+        shouldAutoLoadPayCloudifier = true;
+      }).finally(()=>{ autoPayCloudInFlight = false; });
+      return;
+    }
+    autoPayCloudInFlight = true;
+    if(payCloudSectionControl && typeof payCloudSectionControl.open === "function"){ payCloudSectionControl.open(); }
+    try{ payCloudInfo.textContent = "⌛ Auto loading captcha…"; }catch(_){ }
+    ensureTurnstile().then(()=>{
+      cloudifierTokenPay = null;
+      renderCloudifierPay();
+      setTimeout(()=>{
+        if(!cloudifierTokenPay){ autoSolveTurnstile(payCloudWidgetId, payCloudInfo, ()=>cloudifierTokenPay); }
+      }, 400);
+    }).catch(e=>{
+      try{ payCloudInfo.textContent = "❌ Auto load failed: " + ((e&&e.message)||e||"Turnstile"); }catch(_){ }
+    }).finally(()=>{
+      autoPayCloudInFlight = false;
+    });
+  }
+
+  function stopPayAutoRetry(){
+    autoRetryPay422Active = false;
+    payAutoRetryPending = false;
+    if(payAutoRetryTimer){ try{ clearTimeout(payAutoRetryTimer); }catch(_){ } payAutoRetryTimer = null; }
+    stopPayRetryCountdown();
+  }
+
+  function payAutoRetryMaybeTrigger(){
+    if(!autoRetryPay422Active || !autoRetryPay422Enabled) return;
+    const manualToken = manualTokPay && manualTokPay.value && manualTokPay.value.trim();
+    const autoToken = cloudifierTokenPay;
+    if(!manualToken && !autoToken) return;
+    if(payAutoRetryPending) return;
+    payAutoRetryPending = true;
+    const delaySec = [5,10,15].includes(payRetryDelaySec) ? payRetryDelaySec : 5;
+    const delayMs = delaySec * 1000;
+    payRetryNextAttemptTs = Date.now() + delayMs;
+    startPayRetryCountdown();
+    if(payAutoRetryTimer){ try{ clearTimeout(payAutoRetryTimer); }catch(_){ } }
+    payAutoRetryTimer = setTimeout(async()=>{
+      payAutoRetryTimer = null;
+      payAutoRetryPending = false;
+      stopPayRetryCountdown();
+      if(!autoRetryPay422Active || !autoRetryPay422Enabled) return;
+      try{ await stepPayNow(); }
+      catch(_){ }
+    }, delayMs);
+  }
+
+  function startPayAutoRetry(){
+    if(!autoRetryPay422Enabled) return;
+    autoRetryPay422Active = true;
+    payAutoRetryPending = false;
+    if(payAutoRetryTimer){ try{ clearTimeout(payAutoRetryTimer); }catch(_){ } payAutoRetryTimer = null; }
+    stopPayRetryCountdown();
+    if(payCloudSectionControl && typeof payCloudSectionControl.open === "function"){ payCloudSectionControl.open(); }
+    cloudifierTokenPay = null;
+    if(autoTokPay) autoTokPay.value = "";
+    if(manualTokPay) manualTokPay.value = "";
+    if(payCloudWidgetId){
+      try{ window.turnstile.reset(payCloudWidgetId); }catch(_){ }
+      payCloudWidgetId = null;
+    }
+    payCloudHost.innerHTML = "";
+    try{ payCloudInfo.textContent = "♻️ Loading new captcha for retry…"; }catch(_){ }
+    if(autoSolveEnabled && hasCapMonsterKey()){
+      const promise = solvePayCaptchaViaCapMonster(true);
+      if(promise && typeof promise.then === "function"){
+        promise
+          .then(()=>{ payAutoRetryMaybeTrigger(); })
+          .catch(err=>{
+            const msg = (err && err.message) ? err.message : String(err || "CapMonster");
+            try{ payCloudInfo.textContent = `❌ CapMonster retry failed: ${msg}`; }catch(_){ }
+          });
+        return;
+      }
+    }
+    ensureTurnstile().then(()=>{
+      renderCloudifierPay();
+    }).catch(e=>{
+      try{ payCloudInfo.textContent = "❌ Turnstile load failed: " + ((e&&e.message)||e||"Turnstile"); }catch(_){ }
+    });
+  }
+
+  async function autoSolveAllCaptchas(reason){
+    if(autoSolveAllInFlight) return;
+    if(!hasCapMonsterKey()){
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = "❗ Provide CapMonster key to auto solve."; }catch(_){ }
+      setStatus("❗ Provide CapMonster key to auto solve.");
+      if(reason === "auto"){ try{ setAutoSolveEnabled(false); }catch(_){ } }
+      return;
+    }
+    autoSolveAllInFlight = true;
+    const defaultBtnText = btnAutoSolveAll ? btnAutoSolveAll.textContent : "";
+    const manualTrigger = reason !== "auto";
+    try{ if(btnAutoSolveAll){ btnAutoSolveAll.disabled = true; btnAutoSolveAll.textContent = manualTrigger ? "Solving…" : "Auto solving…"; } }catch(_){ }
+    if(capMonsterInfo){
+      try{ capMonsterInfo.textContent = manualTrigger ? "🤖 Solving all captchas via CapMonster…" : "🤖 Auto solving captchas…"; }catch(_){ }
+    }
+    setStatus(manualTrigger ? "🤖 Solving all captchas via CapMonster…" : "🤖 Auto solving captchas…");
+    try{
+      const hasManualShared = !!(manualTokShared && manualTokShared.value && manualTokShared.value.trim());
+      const hasManualApp = !!(manualTokApp && manualTokApp.value && manualTokApp.value.trim());
+      const hasManualPay = !!(manualTokPay && manualTokPay.value && manualTokPay.value.trim());
+      if(!cloudifierTokenShared && !hasManualShared){ await solveSharedCaptchaViaCapMonster(reason === "auto"); }
+      if(!cloudifierTokenApp && !hasManualApp && (manualTrigger || shouldAutoLoadAppCloudifier || authToken)){
+        await solveApplicationCaptchaViaCapMonster(reason === "auto");
+      }
+      if(!cloudifierTokenPay && !hasManualPay && (manualTrigger || shouldAutoLoadPayCloudifier)){
+        await solvePayCaptchaViaCapMonster(reason === "auto");
+      }
+      if(capMonsterInfo){
+        try{ capMonsterInfo.textContent = manualTrigger ? "✅ All captchas solved via CapMonster." : "✅ Auto solve ready."; }catch(_){ }
+      }
+      setStatus(manualTrigger ? "✅ All captchas solved via CapMonster." : "✅ Auto solve ready.");
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err);
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = `❌ Auto solve failed: ${msg}`; }catch(_){ }
+      setStatus(`❌ Auto solve failed: ${msg}`);
+    }finally{
+      autoSolveAllInFlight = false;
+      try{ if(btnAutoSolveAll){ btnAutoSolveAll.disabled = false; btnAutoSolveAll.textContent = defaultBtnText || "Auto Solve Captchas"; } }catch(_){ }
+    }
+  }
+
+  function setAutoSolveEnabled(on){
+    const desired = !!on;
+    if(desired && !hasCapMonsterKey()){
+      if(capMonsterInfo) try{ capMonsterInfo.textContent = "❗ Provide CapMonster key to auto solve."; }catch(_){ }
+      setStatus("❗ Provide CapMonster key to auto solve.");
+      autoSolveEnabled = false;
+      try{ localStorage.setItem("auto_solve_captchas","0"); }catch(_){ }
+      if(autoSolveCaptchaCB && autoSolveCaptchaCB.checked){ autoSolveCaptchaCB.checked = false; }
+      return;
+    }
+    autoSolveEnabled = desired;
+    try{ localStorage.setItem("auto_solve_captchas", autoSolveEnabled ? "1" : "0"); }catch(_){ }
+    if(autoSolveCaptchaCB && autoSolveCaptchaCB.checked !== autoSolveEnabled){
+      autoSolveCaptchaCB.checked = autoSolveEnabled;
+    }
+    if(autoSolveEnabled){
+      const needsShared = !cloudifierTokenShared && !(manualTokShared && manualTokShared.value && manualTokShared.value.trim());
+      const needsApp = !cloudifierTokenApp && !(manualTokApp && manualTokApp.value && manualTokApp.value.trim()) && (shouldAutoLoadAppCloudifier || authToken);
+      const needsPay = !cloudifierTokenPay && !(manualTokPay && manualTokPay.value && manualTokPay.value.trim()) && shouldAutoLoadPayCloudifier;
+      if(needsShared || needsApp || needsPay){
+        autoSolveAllCaptchas("auto").catch(()=>{});
+      } else if(capMonsterInfo){
+        try{ capMonsterInfo.textContent = "🤖 Auto solve enabled."; }catch(_){ }
+      }
+      if(shouldAutoLoadAppCloudifier){ autoLoadApplicationCloudifierIfNeeded(); }
+      if(shouldAutoLoadPayCloudifier){ autoLoadPayCloudifierIfNeeded(); }
+    } else {
+      if(capMonsterInfo){
+        try{ capMonsterInfo.textContent = hasCapMonsterKey() ? "ℹ️ Auto solve disabled. Use manual buttons." : "❗ Provide CapMonster key to auto solve."; }
+        catch(_){ }
+      }
+    }
+  }
+
+  if(autoSolvePrefFromStorage){
+    setTimeout(()=>{ setAutoSolveEnabled(true); }, 0);
+  } else {
+    setTimeout(()=>{ setAutoSolveEnabled(false); }, 0);
+  }
+
+  // Payment UI
+  const payRetryRow = document.createElement("div");
+  Object.assign(payRetryRow.style,{display:"flex",alignItems:"center",gap:"8px",marginTop:"4px",marginBottom:"8px"});
+  autoRetryPay422CB = document.createElement("input");
+  autoRetryPay422CB.type = "checkbox";
+  autoRetryPay422CB.checked = !!autoRetryPay422Enabled;
+  const payRetryText = document.createElement("span");
+  payRetryText.textContent = "Auto retry Pay Now on 422 (reload captcha)";
+  payRetryText.style.fontSize = "13px";
+  payRetryText.style.opacity = 0.9;
+  const payRetryDelayLabel = document.createElement("span");
+  payRetryDelayLabel.textContent = "Delay";
+  payRetryDelayLabel.style.fontSize = "12px";
+  payRetryDelayLabel.style.opacity = 0.75;
+  payRetryDelayLabel.style.flex = "0 0 auto";
+  payRetryDelaySelect = select([["5 s","5"],["10 s","10"],["15 s","15"]]);
+  payRetryDelaySelect.style.flex = "0 0 auto";
+  payRetryDelaySelect.style.width = "86px";
+  payRetryDelaySelect.style.minWidth = "72px";
+  payRetryDelaySelect.value = String(payRetryDelaySec);
+  if(!["5","10","15"].includes(payRetryDelaySelect.value)){
+    payRetryDelaySelect.value = "5";
+    payRetryDelaySec = 5;
+  }
+  payRetryCountdownEl = document.createElement("span");
+  Object.assign(payRetryCountdownEl.style,{fontSize:"12px",opacity:0.75,display:"none",whiteSpace:"nowrap"});
+  payRetryCountdownEl.textContent = "";
+  payRetryRow.append(autoRetryPay422CB, payRetryText, payRetryDelayLabel, payRetryDelaySelect, payRetryCountdownEl);
+  box.append(payRetryRow);
+  const syncPayRetryPref = ()=>{
+    autoRetryPay422Enabled = !!(autoRetryPay422CB && autoRetryPay422CB.checked);
+    try{ localStorage.setItem("auto_retry_pay422", autoRetryPay422Enabled ? "1" : "0"); }catch(_){ }
+    if(!autoRetryPay422Enabled){
+      stopPayAutoRetry();
+    } else {
+      updatePayRetryCountdownDisplay();
+    }
+  };
+  autoRetryPay422CB.addEventListener("change", syncPayRetryPref);
+
+  const syncPayRetryDelayPref = ()=>{
+    if(!payRetryDelaySelect) return;
+    let selected = parseInt(payRetryDelaySelect.value, 10);
+    if(Number.isNaN(selected) || ![5,10,15].includes(selected)){
+      selected = 5;
+      payRetryDelaySelect.value = "5";
+    }
+    payRetryDelaySec = selected;
+    try{ localStorage.setItem("auto_retry_pay422_delay_sec", String(payRetryDelaySec)); }catch(_){ }
+    if(autoRetryPay422Active){
+      if(payAutoRetryTimer){ try{ clearTimeout(payAutoRetryTimer); }catch(_){ } payAutoRetryTimer = null; }
+      payAutoRetryPending = false;
+      payRetryNextAttemptTs = null;
+      stopPayRetryCountdown();
+      if((manualTokPay && manualTokPay.value && manualTokPay.value.trim()) || cloudifierTokenPay){
+        payAutoRetryMaybeTrigger();
+      }
+    }
+  };
+  if(payRetryDelaySelect){ payRetryDelaySelect.addEventListener("change", syncPayRetryDelayPref); }
+
+  const btnPayNow=btn("Pay Now","#0d6efd");
+  const payWrap=document.createElement("div"); Object.assign(payWrap.style,{display:"none",marginTop:"6px"});
+  const payLink=document.createElement("a"); payLink.target="_blank"; payLink.rel="noopener"; payLink.style.color="#61dafb";
+  payWrap.append("Payment: ",payLink);
+  box.append(row(btnPayNow), payWrap);
+
+  // === Confirm Payment area
+  const confirmPayloadBox = textarea("Paste full payload OR full URL OR JSON here…");
+  const btnConfirmPayment = btn("Confirm Payment","#6f42c1");
+  box.append(confirmPayloadBox, row(btnConfirmPayment));
+
+  // =============== Export / Import (below Confirm Payment) ===============
+  const btnExport = btn("Export","#198754");
+  const btnImport = btn("Import","#495057");
+  const fileInput = document.createElement("input"); fileInput.type = "file"; fileInput.accept = ".json,application/json"; fileInput.style.display = "none";
+
+  function readCurrentState(){
+    const famCount = parseInt(famCountSel.value,10) || 0;
+    const family = [];
+    for(let i=1;i<=famCount;i++){
+      const box = famFieldsWrap.querySelector(`[data-family-index="${i}"]`);
+      if (!box) continue;
+      family.push({
+        name: box.querySelector(".f-name")?.value || "",
+        webfile_no: box.querySelector(".f-wf")?.value || "",
+        again_webfile_no: box.querySelector(".f-wfr")?.value || ""
+      });
+    }
+    return {
+      _meta: { app: "IVAC Helper", version: 1, saved_at: new Date().toISOString() },
+      login: { mobile: mobileInp.value || "", password: passInp.value || "" },
+      application: {
+        highcom: highcomSel.value,
+        ivac_id: ivacSel.value,
+        visa_type: visaSel.value,
+        webfile_id: webfile.value || "",
+        visit_purpose: visitPurpose.value || "",
+        family_count: String(famCount)
+      },
+      personal: { full_name: pFullName.value || "", email: pEmail.value || "", phone: pPhone.value || "", family }
+    };
+  }
+  function applyState(data){
+    try{
+      if(data.login){
+        if(typeof data.login.mobile === "string") mobileInp.value = data.login.mobile;
+        if(typeof data.login.password === "string") passInp.value = data.login.password;
+      }
+      if(data.application){
+        if(data.application.highcom) highcomSel.value = String(data.application.highcom);
+        if(data.application.ivac_id) ivacSel.value = String(data.application.ivac_id);
+        if(data.application.visa_type) visaSel.value = String(data.application.visa_type);
+        if(typeof data.application.webfile_id === "string") webfile.value = data.application.webfile_id;
+        if(typeof data.application.visit_purpose === "string") visitPurpose.value = data.application.visit_purpose;
+        if(data.application.family_count != null){
+          famCountSel.value = String(data.application.family_count);
+          renderFamilyFields(parseInt(famCountSel.value,10) || 0);
+        }
+      }
+      if(data.personal){
+        if(typeof data.personal.full_name === "string") pFullName.value = data.personal.full_name;
+        if(typeof data.personal.email === "string") pEmail.value = data.personal.email;
+        if(typeof data.personal.phone === "string") pPhone.value = data.personal.phone;
+        if(Array.isArray(data.personal.family)){
+          data.personal.family.forEach((f,i)=>{
+            const idx = i+1;
+            const box = famFieldsWrap.querySelector(`[data-family-index="${idx}"]`);
+            if(!box) return;
+            const nameI = box.querySelector(".f-name");
+            const wfI = box.querySelector(".f-wf");
+            const wfrI = box.querySelector(".f-wfr");
+            if(nameI && typeof f.name === "string") nameI.value = f.name;
+            if(wfI && typeof f.webfile_no === "string") wfI.value = f.webfile_no;
+            if(wfrI && typeof f.again_webfile_no === "string") wfrI.value = f.again_webfile_no;
+          });
+        }
+      }
+      setStatus("✅ Imported data applied."); beep();
+    }catch(err){ setStatus("❌ Import failed: " + (err && err.message ? err.message : String(err))); }
+  }
+  btnExport.onclick = ()=>{
+    try{
+      const data = readCurrentState();
+      const blob = new Blob([JSON.stringify(data,null,2)], {type:"application/json"});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `ivac-helper-${new Date().toISOString().replace(/[:.]/g,'-')}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 1000);
+      setStatus("⬇️ Exported.");
+    }catch(e){ setStatus("❌ Export failed."); }
+  };
+  btnImport.onclick = ()=>{ fileInput.click(); };
+  fileInput.addEventListener("change", ()=>{
+    const f = fileInput.files && fileInput.files[0]; if(!f){ return; }
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      try{ const txt = String(reader.result || ""); const json = JSON.parse(txt); applyState(json); }
+      catch(e){ setStatus("❌ Invalid import file."); }
+      finally{ fileInput.value = ""; }
+    };
+    reader.readAsText(f);
+  });
+  box.append(row(btnExport, btnImport), fileInput);
+
+  // =============== OTP 10m countdown ===============
+  function startOtpCountdown(){
+    otpEndTs = Date.now() + 10*60*1000;
+    if (otpCountdownTimer){ clearInterval(otpCountdownTimer); otpCountdownTimer = null; }
+    const tick = ()=>{
+      if (!otpEndTs) return;
+      const left = otpEndTs - Date.now();
+      if (left <= 0){
+        clearInterval(otpCountdownTimer); otpCountdownTimer=null; otpEndTs=null;
+        otpTimerLine.textContent = "⏰ OTP expired.";
+        return;
+      }
+      const m=Math.floor(left/60000), s=Math.floor((left%60000)/1000);
+      otpTimerLine.textContent = `📩 OTP valid for ${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+    };
+    tick();
+    otpCountdownTimer = setInterval(tick, 1000);
+  }
+
+// =============== Steps (Application-info/OTP/Slot/Payment) ===============
+async function stepApplication(){
+  const token = (manualTokApp.value?.trim?.() || cloudifierTokenApp || cloudifierTokenShared || "");
+  if (!token){ setStatus("❗ Captcha token (Application) প্রয়োজন। Application Cloudifier solve করুন।"); return false; }
+
+  const usp = new URLSearchParams();
+  usp.append("family_count", famCountSel.value);
+  usp.append("highcom",      highcomSel.value);
+  usp.append("ivac_id",      ivacSel.value);
+  usp.append("visa_type",    visaSel.value);
+  usp.append("asweoi_erilfs",(visitPurpose.value||"").trim());
+  const wf = (webfile.value||"").trim();
+  usp.append("webfile_id",        wf);
+  usp.append("webfile_id_repeat", wf);
+
+  // Turnstile tokens
+  usp.append("captcha_token",         token);
+  usp.append("cf-turnstile-response", token);
+  usp.append("y6e7uk_token_t6d8n3",   token);
+
+  const url = API + "/payment/application-r5s7h3-submit-hyju6t";
+  const {ok,res,text,json} = await withRetry(() => POST_FORM_URLENCODED(url, usp.toString(), "Application", {
+    withAuth:true, withCSRF:true,
+    extraHeaders: { "cf-turnstile-response": token, "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With":"XMLHttpRequest" },
+    _fetch: { referrer: REF_APPLICATION }
+  }));
+
+  setStatus(ok ? "✅ Application saved." : ("❌ Application failed. " + (res ? ("["+res.status+"] ") : "") + (text ? String(text).slice(0,180) : "")));
+
+  // Capture webfile
+  let wfSaved = (json && (json.data && (json.data.webfile_id || json.data.webfile_no || json.data.web_file_no))) ||
+                (json && (json.webfile_id || json.webfile_no || json.web_file_no)) ||
+                (typeof extractWebfileFromResponse === "function" ? extractWebfileFromResponse({json, text}) : "") ||
+                wf;
+
+  if (ok) {
+    try {
+      if (wfSaved && typeof wfSaved === "string") {
+        setWebfileLS(wfSaved);
+        localStorage.setItem("webfile_id", wfSaved);
+        localStorage.setItem("webfile", wfSaved);
+        if(!webfile.value) webfile.value = wfSaved;
+        mirrorWebfileToSite(); setTimeout(mirrorWebfileToSite, 150); setTimeout(mirrorWebfileToSite, 800);
+      } else {
+        setWebfileLS(wf);
+      }
+      localStorage.setItem("applicant", JSON.stringify({
+        highcom: highcomSel.value, ivac_id: ivacSel.value, visa_type: visaSel.value,
+        visit_purpose: (visitPurpose.value||"").trim(), webfile_id: wfSaved || wf, family_count: famCountSel.value
+      }));
+      localStorage.setItem("activeStep", "2");
+    }catch(_){ }
+    setActiveStepLS(2);
+    gotoSiteStep(2);
+    setTimeout(mirrorWebfileToSite, 800);
+    beep(); beep();
+  }
+  return ok;
+}
+
+
+async function stepPersonal(){
+  const cnt = parseInt(famCountSel.value,10) || 0;
+  const family = {};
+  for (let i=1;i<=cnt;i++){
+    const b = famFieldsWrap.querySelector(`[data-family-index="${i}"]`);
+    if(!b) continue;
+    family[i] = {
+      name: b.querySelector('.f-name')?.value || '',
+      webfile_no: b.querySelector('.f-wf')?.value || '',
+      again_webfile_no: b.querySelector('.f-wfr')?.value || ''
+    };
+  }
+  const wfStored = (function(){ var v=(webfile.value||"").trim(); if(!v){ v=localStorage.getItem("webfile_id")||localStorage.getItem("webfile")||localStorage.getItem("wfile")||""; } return v; })();
+  const payload = { full_name: pFullName.value.trim(), email_name: pEmail.value.trim(), phone: pPhone.value.trim(), webfile_id: wfStored, family };
+  const {ok,res,text,json} = await withRetry(() => POST_JSON("/payment/personal-info-submit", payload, "Personal", { withAuth:true, withCSRF:true, _fetch:{ referrer: REF_APPLICATION } }));
+  setStatus(ok ? "✅ Personal saved." : ("❌ Personal failed. " + (res?("["+res.status+"] "):"") + (text?String(text).slice(0,180):"")));
+  if (ok){
+    try{
+      localStorage.setItem("personal_info", JSON.stringify({ full_name: payload.full_name, email_name: payload.email_name, phone: payload.phone, webfile_id: payload.webfile_id, family: payload.family }));
+      localStorage.setItem("activeStep", "3");
+    }catch(_){ }
+    setActiveStepLS(3); gotoSiteStep(3); try{ hydrateOverviewFeesAuto(); hydrateOverviewPersonalAuto(); }catch(_){} beep(); beep();
+  }
+  return ok;
+}
+
+
+async function stepOverview(){
+  const {ok,res,text,json}=await withRetry(() => POST_JSON("/payment/overview-submit", {}, "Overview", { withAuth:true, withCSRF:true, _fetch:{ referrer: REF_APPLICATION } }));
+  setStatus(ok?"✅ Overview OK.":"❌ Overview failed.");
+  if(ok){
+    try{
+      const appl = localStorage.getItem("applicant");
+      const pers = localStorage.getItem("personal_info");
+      if (appl) { localStorage.setItem("applicant_backup", appl); localStorage.removeItem("applicant"); }
+      if (pers) { localStorage.setItem("personal_info_backup", pers); localStorage.removeItem("personal_info"); }
+      localStorage.setItem("activeStep","4");
+    }catch(_){ }
+    setActiveStepLS(4); gotoSiteStep(4); beep(); beep();
+    try { await GET("/payment/checkout","Payment Checkout", { _fetch:{ referrer: REF_APPLICATION } }); } catch(_){ }
+  }
+  return ok;
+}
+
+async function stepSendOtp(resend=false){
+  const payload = resend ? {resend: 1} : {resend: 0};
+  const out=await withRetry(()=>POST_JSON("/payment/pay-otp-sent",payload,resend?"Resend OTP":"Send OTP", {
+    withAuth:true, withCSRF:true,
+    _fetch:{ referrer: REF_APPLICATION }
+  }));
+  const ok=out.ok||/sms send successfully/i.test(out.text||"");
+  if(ok){
+    otpBanner.textContent="✅ OTP sent successfully";
+    otpBanner.style.display="block";
+    if(otpBannerHideTimer) clearTimeout(otpBannerHideTimer);
+    otpBannerHideTimer=setTimeout(()=>{ otpBanner.style.display="none"; },10*60*1000);
+    startOtpCountdown();
+    setStatus("✅ OTP sent."); beep();
+    requestAutoPayCloudifier();
+    return true;
+  } else { setStatus("❌ OTP send failed."); }
+  return ok;
+}
+async function stepVerifyOtp(){
+  const otp=otpInput.value.trim();
+  if(!otp){ setStatus("❗ Enter OTP."); return false; }
+  const out=await withRetry(()=>POST_JSON("/payment/pay-otp-verify",{otp},"Verify OTP", {
+    withAuth:true, withCSRF:true,
+    _fetch:{ referrer: REF_APPLICATION }
+  }));
+  if(out.ok){
+    const dates = out.json?.data?.slot_dates || [];
+    try { localStorage.setItem("slot_dates", JSON.stringify(dates)); } catch(_){ }
+    const date = dates[0];
+    if(date){
+      otpVerifyInfo.textContent=`✅ Appointment Date: ${date}`;
+      otpVerifyInfo.style.display="block";
+      if(otpInfoHideTimer) clearTimeout(otpInfoHideTimer);
+      otpInfoHideTimer=setTimeout(()=>{ otpVerifyInfo.style.display="none"; },5*60*1000);
+      dateInput.value=date;
+    }
+    setStatus("✅ OTP verified."); beep(); return true;
+  }
+  setStatus("❌ OTP verify failed."); return false;
+}
+async function stepSlotTime(){
+  const d=dateInput.value;
+  if(!d){ setStatus("❗ Pick a date."); return false; }
+  const out=await withRetry(()=>POST_JSON("/payment/pay-slot-time",{appointment_date:d},"Slot Time", {
+    withAuth:true, withCSRF:true,
+    _fetch:{ referrer: REF_APPLICATION }
+  }));
+  if(out.ok){
+    try {
+      localStorage.setItem("appointment_date", d);
+      const times = out.json?.data?.slot_times || out.json?.data?.times || [];
+      if (Array.isArray(times)) localStorage.setItem("slot_times", JSON.stringify(times));
+    } catch(_) {}
+    const slot=out.json?.data?.slot_times?.[0];
+    if(slot?.time_display){
+      slotInfo.textContent=`✅ Available Slot: ${slot.availableSlot} — 🕒 ${slot.time_display}`;
+      slotInfo.style.display="block";
+      if(slotInfoHideTimer) clearTimeout(slotInfoHideTimer);
+      slotInfoHideTimer=setTimeout(()=>{ slotInfo.style.display="none"; },5*60*1000);
+    }
+    setStatus("✅ Slot time OK."); beep(); return true;
+  }
+  setStatus("❌ Slot time failed."); return false;
+}
+
+async function stepPayNow(){
+  const d = (dateInput.value || "").trim();
+  if(!d){ setStatus("❗ Date missing."); return false; }
+  if(!authToken){ setStatus("❗ Login token missing. নিচের Token ঘরে সেট করো বা Login করো."); return false; }
+
+  const payment = paymentMap[paymentSelect.value] || paymentMap.visa;
+  const tokenPay = (manualTokPay.value.trim() || cloudifierTokenPay || "");
+  if(!tokenPay){
+    setStatus("❗ Pay Now Cloudifier token missing. উপরের 'Cloudifier (Pay Now)' solve করুন।");
+    return false;
+  }
+  const payload = {
+    appointment_date: d,
+      appointment_time: timeSelect.value,
+      selected_payment: payment,
+      k5t0g8_token_y4v9f6: tokenPay
+  };
+  const out = await withRetry(()=>POST_JSON("/payment/h7j3wt-now-y0k3d6", payload, "Pay Now", {
+    withAuth:true, withCSRF:true,
+    _fetch:{ referrer: REF_APPLICATION }
+  }));
+  try { localStorage.setItem("appointment_date", d); localStorage.setItem("appointment_time", timeSelect.value || ""); } catch(_){ }
+
+  if(out.ok && out.json?.data?.url){
+    const link = out.json.data.url;
+    try { window.open(link, "_blank", "noopener"); } catch(_) {
+      const a = document.createElement("a"); a.href = link; a.target = "_blank"; a.rel = "noopener"; document.body.appendChild(a); a.click(); a.remove();
+    }
+    payLink.textContent = link; payLink.href = link; payWrap.style.display = "block";
+    setStatus("✅ Payment link generated.");
+    stopPayAutoRetry();
+    beep();
+    return true;
+  }
+  const statusCode = out?.res?.status || 0;
+  if(statusCode === 422){
+    if(autoRetryPay422CB && !autoRetryPay422CB.checked){
+      autoRetryPay422CB.checked = true;
+      if(typeof syncPayRetryPref === "function"){ syncPayRetryPref(); }
+      else {
+        autoRetryPay422Enabled = true;
+        try{ localStorage.setItem("auto_retry_pay422", "1"); }catch(_){ }
+      }
+    } else if(!autoRetryPay422Enabled){
+      autoRetryPay422Enabled = true;
+      try{ localStorage.setItem("auto_retry_pay422", "1"); }catch(_){ }
+    }
+    if(autoRetryPay422Enabled){
+      setStatus("⚠️ Payment returned 422. Loading new captcha and retrying…");
+      startPayAutoRetry();
+      return false;
+    }
+  }
+  stopPayAutoRetry();
+  setStatus(`⚠️ Payment failed ${statusCode||""}: ${out?.text?.slice(0,200)||"No message"}`);
+  return false;
+}
+
+
+function buildFormBodyFromInput(raw){
+  if(!raw) return null;
+  raw = raw.trim();
+  if(/^https?:\/\//i.test(raw)){
+    try{ const u=new URL(raw); return u.search.replace(/^\?/,''); }catch(_){ }
+  }
+  if(raw.includes("=") && !raw.trim().startsWith("{")) return raw;
+  if(raw.trim().startsWith("{")){
+    try{
+      const obj = JSON.parse(raw);
+      const usp = new URLSearchParams();
+      Object.keys(obj).forEach(k=>{ if(obj[k]!==undefined && obj[k]!==null) usp.append(k, String(obj[k])); });
+      return usp.toString();
+    }catch(_){ return null; }
+  }
+  return null;
+}
+async function stepConfirmPayment(){
+  const bodyStr = buildFormBodyFromInput(confirmPayloadBox.value);
+  if(!bodyStr){ setStatus("❌ Invalid payload. Paste full URL or form-encoded string or JSON."); return false; }
+  const {ok,res,text,json} = await withRetry(()=>POST_FORM_URLENCODED(PROCESS_URL, bodyStr, "Confirm Payment", {
+    withAuth:true, withCSRF:true,
+    _fetch:{ referrer: REF_APPLICATION }
+  }));
+  if(ok || (res && res.status===200)){
+    setStatus("✅ Payment processed.\n" + (json ? JSON.stringify(json).slice(0,500) : text.slice(0,500)));
+    beep(); return true;
+  }
+  setStatus("❌ Payment process failed."); return false;
+}
+
+// =============== Auto flow ===============
+  function autoNextFrom(current){
+    if(!autoCB.checked) return;
+    const delay = parseInt(autoDelaySec.value||"1",10)*1000;
+    if(autoNextTimer) clearTimeout(autoNextTimer);
+    autoNextTimer = setTimeout(async ()=>{
+      if(hardStop || !autoCB.checked) return;
+      switch(current){
+        case "MobileVerify": if(!passLoginCompleted){ await stepPasswordLogin(); } break;
+        case "Login": if(loginOtpInp.value.trim().length>=6){ await stepLoginWithOTP(); } break;
+        case "Application": if(await stepPersonal()) autoNextFrom("Personal"); break;
+        case "Personal": if(await stepOverview()) autoNextFrom("Overview"); break;
+        case "Overview": if(await stepSendOtp(false)) autoNextFrom("SendOTP"); break;
+        case "SendOTP": /* wait for OTP verify */ break;
+        case "VerifyOTP": if(await stepSlotTime()) autoNextFrom("SlotTime"); break;
+        case "SlotTime": if(await stepPayNow()) autoNextFrom("PayNow"); break;
+        case "PayNow": /* user does payment then confirm */ break;
+        default: break;
+      }
+    }, delay);
+  }
+
+  // =============== Wire actions ===============
+  btnApplication.onclick  = async()=>{ if(await stepApplication()) autoNextFrom("Application"); };
+  btnPersonal.onclick     = async()=>{ if(await stepPersonal())   autoNextFrom("Personal");    };
+  btnOverview.onclick     = async()=>{ if(await stepOverview())   autoNextFrom("Overview");    };
+
+  btnSendOTP.onclick      = async()=>{ await stepSendOtp(false); };
+  btnResend.onclick       = async()=>{ await stepSendOtp(true);  };
+  btnVerifyOTP.onclick    = async()=>{ if(await stepVerifyOtp()) autoNextFrom("VerifyOTP");   };
+  btnSlotTime.onclick     = async()=>{ if(await stepSlotTime())  autoNextFrom("SlotTime");    };
+  btnPayNow.onclick       = async()=>{ await stepPayNow(); };
+  btnConfirmPayment.onclick = async()=>{ await stepConfirmPayment(); };
+
+  
+try{
+  if (localStorage.getItem("activeStep") === "3") {
+    setTimeout(()=>{ try{ hydrateOverviewFeesAuto(); hydrateOverviewPersonalAuto(); }catch(_){} }, 350);
+  }
+  window.addEventListener("storage", function(){
+    try{ hydrateOverviewFeesAuto(); hydrateOverviewPersonalAuto(); }catch(_){ }
+  });
+}catch(_){ }
+
+
+  // =============== Teardown (single instance guarantee) ===============
+  window.__ivac_v2_helper__ = true;
+  window.__ivac_v2_helper_teardown = function(reason){
+    try { hardStop = true; stopSeq++; } catch(_){ }
+    try { (activeRequests || []).forEach(({controller}) => { try{ controller.abort(); }catch(_){ } }); activeRequests = []; } catch(_){ }
+    [autoNextTimer, loginCountdownTimer, otpCountdownTimer, slotInfoHideTimer, otpInfoHideTimer, otpBannerHideTimer]
+      .forEach(t => { try{ clearTimeout(t); }catch(_){ } try{ clearInterval(t); }catch(_){ } });
+    clearScheduleTimers();
+    stopPayAutoRetry();
+    if(postLoginAppClickTimer){ try{ clearTimeout(postLoginAppClickTimer); }catch(_){ } postLoginAppClickTimer = null; }
+    pendingAutoApplicationClick = false;
+    try { if (window.__ivac_v2_orig_fetch) window.fetch = window.__ivac_v2_orig_fetch; } catch(_){ }
+    try { let n; while ((n = document.getElementById(ROOT_ID))) n.remove(); } catch(_){ }
+    try { delete window.__ivac_v2_helper__; } catch(_){ }
+    try { delete window.__ivac_v2_helper_teardown; } catch(_){ }
+    console.log("[IVAC Helper] Teardown complete.", reason || "");
+  };
+
+  setStatus("Ready for next request. ✅ (HAR-parity headers + storage backups + Cloudifier split)");
+
+})();
+
+/* ===== IVAC LocalStorage Normalizer (UI parity) =====
+   Ensures programmatic login writes the same keys as normal UI login.
+   - Fills: auth_name, auth_email, user_email, auth_phone, user_phone, language, authStep, activeStep
+   - Derives name/email/phone from JWT if available; falls back to existing helper inputs / LS.
+*/
+(function(){
+  function parseJWT(t){
+    try{
+      var base = t.split('.')[1];
+      base = base.replace(/-/g,'+').replace(/_/g,'/');
+      var json = decodeURIComponent(escape(atob(base)));
+      return JSON.parse(json);
+    }catch(e){ return {}; }
+  }
+  function readHelper(selector){
+    try{ var el = document.querySelector(selector); return el && el.value ? el.value.trim() : ""; }catch(_){ return ""; }
+  }
+  function ensureLS(){
+    var token = localStorage.getItem('access_token') || localStorage.getItem('authToken') || "";
+    if(!token) return;
+    if(!localStorage.getItem('access_token')) localStorage.setItem('access_token', token);
+    var p = parseJWT(token);
+    var name = p.name || (p.user && (p.user.name || p.user.full_name)) || p.full_name || readHelper('#ivac-helper-box input[placeholder="Applicant Full Name"]') || "";
+    var email = p.email || (p.user && p.user.email) || readHelper('#ivac-helper-box input[placeholder="Applicant Email"]') || localStorage.getItem('user_email') || "";
+    var phone = p.phone || p.mobile || (p.user && (p.user.phone || p.user.mobile)) || readHelper('#ivac-helper-box input[placeholder="Applicant Phone (11 digits)"]') || localStorage.getItem('user_phone') || localStorage.getItem('auth_phone') || "";
+    if (name && !localStorage.getItem('auth_name')) { localStorage.setItem('auth_name', name); }
+    if (name && !localStorage.getItem('user_name')) { localStorage.setItem('user_name', name); }
+    if (email && !localStorage.getItem('auth_email')) { localStorage.setItem('auth_email', email); }
+    if (email && !localStorage.getItem('user_email')) { localStorage.setItem('user_email', email); }
+    if (phone && !localStorage.getItem('auth_phone')) { localStorage.setItem('auth_phone', phone); }
+    if (phone && !localStorage.getItem('user_phone')) { localStorage.setItem('user_phone', phone); }
+    if (!localStorage.getItem('language')) { localStorage.setItem('language', 'en'); }
+    if (!localStorage.getItem('authStep')) { localStorage.setItem('authStep', '100'); }
+    if (!localStorage.getItem('activeStep')) { localStorage.setItem('activeStep', '1'); }
+    if (!localStorage.getItem('auth_photo')) { localStorage.setItem('auth_photo', ''); }
+    if (!localStorage.getItem('authToken')) localStorage.setItem('authToken', token);
+    if (!localStorage.getItem('tokenType')) localStorage.setItem('tokenType','Bearer');
+  }
+  try { ensureLS(); } catch(_) {}
+  setTimeout(function(){ try{ ensureLS(); }catch(_){}} , 800);
+  setTimeout(function(){ try{ ensureLS(); }catch(_){}} , 2000);
+})();
+
+/* ===== IVAC LS Parity Sync (ensure missing UI keys exist) ===== */
+(function(){
+  function paritySync(){
+    var pairs = [['auth_name','user_name'],['auth_email','user_email'],['auth_phone','user_phone']];
+    for (var i=0;i<pairs.length;i++){
+      var a=pairs[i][0], b=pairs[i][1];
+      var va = localStorage.getItem(a), vb = localStorage.getItem(b);
+      if (va && !vb) localStorage.setItem(b, va);
+      if (vb && !va) localStorage.setItem(a, vb);
+      if (!va && !vb) { localStorage.setItem(a,''); localStorage.setItem(b,''); }
+    }
+    if (localStorage.getItem('auth_photo')===null) localStorage.setItem('auth_photo','');
+  }
+  try { paritySync(); } catch(_){ }
+  window.addEventListener('storage', function(){ try{ paritySync(); }catch(_){ } });
+  setTimeout(function(){ try{ paritySync(); }catch(_){ } }, 600);
+  setTimeout(function(){ try{ paritySync(); }catch(_){ } }, 1500);
+})();
+
+
+try{
+  const __ivacFeeFixObs = new MutationObserver(()=>{
+    try {
+      if (localStorage.getItem("activeStep")==="3") { hydrateOverviewFeesAuto(); hydrateOverviewPersonalAuto(); }
+    } catch(_){ }
+  });
+  __ivacFeeFixObs.observe(document.body, {subtree:true, childList:true, characterData:true});
+}catch(_){ }
+
